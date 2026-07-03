@@ -438,3 +438,45 @@ def test_optimizer_partition_with_adaln():
     grouped = [id(p) for g in opt.param_groups for p in g["params"]]
     assert set(grouped) == {id(p) for p in m.parameters()}
     assert len(grouped) == len(set(grouped))
+
+
+# ======================================================================================
+# FSDP path (optimizer builder is testable on CPU without a process group)
+# ======================================================================================
+def test_adamw_optimizer_partitions_all_params():
+    m, cfg = build(use_iter_adaln=True, n_routed_experts=8, top_k=2, **LOOP_KW)
+    opt = m.setup_adamw_optimizer()
+    import torch as _t
+    assert isinstance(opt, _t.optim.AdamW)
+    grouped = [id(p) for g in opt.param_groups for p in g["params"]]
+    assert set(grouped) == {id(p) for p in m.parameters()}
+    assert len(grouped) == len(set(grouped))
+
+
+def test_adamw_optimizer_dense_runs_a_step():
+    """The FSDP AdamW optimizer (plain torch AdamW) should train the model on CPU too."""
+    torch.manual_seed(0)
+    m, cfg = build(n_routed_experts=8, top_k=2)
+    m.train()
+    opt = m.setup_adamw_optimizer()
+    idx, tgt = a_batch(cfg)
+    first = m(idx, tgt).item()
+    for _ in range(15):
+        opt.zero_grad(set_to_none=True)
+        loss = m(idx, tgt)
+        loss.backward()
+        opt.step()
+    assert loss.item() < first, "AdamW optimizer should reduce the loss"
+
+
+def test_adamw_optimizer_lower_lr_for_adaln():
+    m, cfg = build(use_iter_adaln=True, **LOOP_KW)
+    opt = m.setup_adamw_optimizer(matrix_lr=0.02)
+    # find the group containing an adaln param and a group with a plain matrix param
+    adaln_w = m.transformer.h[1].adaln_attn.adaln_gamma.weight
+    attn_w = m.transformer.h[1].attn.c_q.weight
+    def lr_of(param):
+        for g in opt.param_groups:
+            if any(p is param for p in g["params"]):
+                return g["lr"]
+    assert lr_of(adaln_w) < lr_of(attn_w), "IterAdaLN group must use a lower LR than matrices"

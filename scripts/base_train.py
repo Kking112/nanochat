@@ -44,6 +44,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
+parser.add_argument("--fsdp", action="store_true", help="shard parameters with FSDP2 (large config; uses plain AdamW instead of Muon). Default path keeps replicated model + MuonAdamW ZeRO-2 optimizer sharding.")
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
@@ -140,25 +141,34 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+def build_model_meta(depth, loopmoe=True):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data).
+
+    loopmoe=True applies the LoopMoE config (MoE + sandwich loop + IterAdaLN). loopmoe=False
+    builds a plain DENSE model of the given depth -- used only for the fixed d12 muP scaling
+    reference (which must stay a standard stack, independent of the actual model's loop/MoE, and
+    whose n_layer=12 would otherwise conflict with the loop's n_prefix+n_loop+n_suffix)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    loopmoe_kwargs = dict()
+    if loopmoe:
+        loopmoe_kwargs = dict(
+            n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
+            top_k=args.top_k, expert_hidden_dim=args.expert_hidden_dim,
+            load_balance_mode=args.load_balance_mode, aux_loss_coef=args.aux_loss_coef,
+            router_bias_update_rate=args.router_bias_update_rate,
+            n_prefix_layers=args.n_prefix_layers, n_loop_layers=args.n_loop_layers,
+            n_suffix_layers=args.n_suffix_layers, loop_iters=args.loop_iters,
+            use_iter_adaln=args.use_iter_adaln, grad_checkpoint_loop=args.grad_checkpoint_loop,
+        )
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
-        # LoopMoE fields
-        n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
-        top_k=args.top_k, expert_hidden_dim=args.expert_hidden_dim,
-        load_balance_mode=args.load_balance_mode, aux_loss_coef=args.aux_loss_coef,
-        router_bias_update_rate=args.router_bias_update_rate,
-        n_prefix_layers=args.n_prefix_layers, n_loop_layers=args.n_loop_layers,
-        n_suffix_layers=args.n_suffix_layers, loop_iters=args.loop_iters,
-        use_iter_adaln=args.use_iter_adaln, grad_checkpoint_loop=args.grad_checkpoint_loop,
+        **loopmoe_kwargs,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -262,6 +272,22 @@ def disable_fp8(model):
             setattr(parent, attr_name, fp8_module)
 
 # -----------------------------------------------------------------------------
+# FSDP2 parameter sharding (large config). Must be applied before torch.compile.
+# Gated behind --fsdp; the default path leaves the model replicated (MuonAdamW shards optimizer
+# state ZeRO-2 style, which is enough for small/medium models).
+if args.fsdp:
+    from nanochat.fsdp_utils import apply_fsdp, is_fsdp_available
+    if device_type != "cuda":
+        print0("Warning: --fsdp requires CUDA, ignoring")
+        args.fsdp = False
+    elif not is_fsdp_available():
+        print0("Warning: FSDP2 (torch.distributed.fsdp.fully_shard) unavailable, ignoring --fsdp")
+        args.fsdp = False
+    else:
+        apply_fsdp(model)
+        print0(f"✓ FSDP2 enabled: parameters sharded per-block across {ddp_world_size} rank(s); using plain AdamW (Muon disabled under FSDP)")
+
+# -----------------------------------------------------------------------------
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
@@ -305,7 +331,7 @@ num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_ref = build_model_meta(12, loopmoe=False) # fixed DENSE d12 muP reference (no loop/MoE)
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -340,16 +366,27 @@ if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-)
+# Initialize the Optimizer. Default: combined MuonAdamW (Muon for matrix params, AdamW for rest).
+# FSDP path: plain AdamW over all params (Muon's hand-rolled collectives are incompatible with
+# FSDP's sharded DTensors). Build on the raw model so it sees the real parameters.
+if args.fsdp:
+    optimizer = orig_model.setup_adamw_optimizer(
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+    )
+else:
+    optimizer = model.setup_optimizer(
+        # AdamW hyperparameters
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        # Muon hyperparameters
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+    )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -558,7 +595,9 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        # Muon-only schedules (momentum warmup, WD cosine). Plain-AdamW groups on the FSDP path
+        # have no 'kind' key, so guard with .get().
+        if group.get('kind') == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
@@ -617,6 +656,16 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        # MoE instrumentation: worst-case per-expert load fraction and mean routing entropy,
+        # so router collapse is visible. moe_load_stats() returns [] for the dense model.
+        moe_stats = orig_model.moe_load_stats()
+        if moe_stats:
+            worst_max_load = max(s["max_load"] for s in moe_stats)
+            mean_entropy = sum(s["entropy"] for s in moe_stats) / len(moe_stats)
+            n_experts = orig_model.config.n_routed_experts
+            print0(f"           MoE: worst expert load {worst_max_load:.3f} (uniform={1.0/n_experts:.3f}) | mean routing entropy {mean_entropy:.3f}")
+            log_data["moe/worst_max_load"] = worst_max_load
+            log_data["moe/mean_entropy"] = mean_entropy
         wandb_run.log(log_data)
 
     # state update

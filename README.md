@@ -107,6 +107,30 @@ See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment
 
 The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
 
+## LoopMoE (looped Mixture-of-Experts)
+
+This fork adds an optional **looped Mixture-of-Experts** architecture on top of stock nanochat:
+routed + shared experts (DeepSeekMoE-style) with auxiliary-loss-free load balancing, a
+prefix / shared-loop-body / suffix "sandwich loop" that reuses the loop body `K` times for extra
+depth at no extra parameters, and token/iteration-conditioned **IterAdaLN** modulation to break
+weight-sharing symmetry. Everything is off by default (default config = stock dense nanochat).
+
+- Full documentation of the config fields, the two example configs, dense↔MoE / loop on↔off, the
+  optimizer wiring, and known pitfalls: **[LOOPMOE.md](LOOPMOE.md)**.
+- Ready-to-run configs: [runs/loopmoe_small.sh](runs/loopmoe_small.sh) (single-GPU, ~1B total /
+  <500M active) and [runs/loopmoe_large.sh](runs/loopmoe_large.sh) (multi-GPU FSDP, ≥10B total).
+- Tests: `NANOCHAT_DTYPE=float32 python -m pytest tests/test_loopmoe.py -v`.
+
+Quick example (small looped-MoE, single GPU):
+
+```
+python -m scripts.base_train \
+    --depth=6 --aspect-ratio=170 --head-dim=128 --window-pattern=L \
+    --n-prefix-layers=2 --n-loop-layers=2 --n-suffix-layers=2 --loop-iters=4 \
+    --n-routed-experts=160 --n-shared-experts=1 --top-k=8 --use-iter-adaln \
+    --num-iterations=4000
+```
+
 ## Running on CPU / MPS
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
@@ -159,12 +183,16 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── dataset.py                  # Download/read utils for pretraining data
 │   ├── engine.py                   # Efficient model inference with KV Cache
 │   ├── execution.py                # Allows the LLM to execute Python code as tool
-│   ├── gpt.py                      # The GPT nn.Module Transformer
+│   ├── fsdp_utils.py               # FSDP2 sharding for the large LoopMoE config
+│   ├── gpt.py                      # The GPT nn.Module Transformer (+ LoopMoE: MoE, loop, IterAdaLN)
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
 │   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
 │   └── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
 ├── pyproject.toml
+├── LOOPMOE.md                      # LoopMoE architecture docs (MoE + loop + IterAdaLN)
 ├── runs
+│   ├── loopmoe_small.sh            # LoopMoE small config (single-GPU, ~1B total)
+│   ├── loopmoe_large.sh            # LoopMoE large config (multi-GPU FSDP, >=10B total)
 │   ├── miniseries.sh               # Miniseries training script
 │   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
 │   ├── scaling_laws.sh             # Scaling laws experiments

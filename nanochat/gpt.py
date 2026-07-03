@@ -930,6 +930,49 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def setup_adamw_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
+                              weight_decay=0.0, scalar_lr=0.5, adaln_lr_scale=0.1):
+        """Plain torch.optim.AdamW over all parameters, for the FSDP (sharded) training path.
+
+        FSDP2 shards parameters as DTensors and manages its own gradient/param communication,
+        which is incompatible with MuonAdamW's hand-rolled all-gather / reduce-scatter. So on the
+        sharded path we drop Muon and put every matrix (attention + MoE experts) on AdamW as well
+        -- the task spec explicitly permits the AdamW-for-experts fallback. Param grouping and the
+        partition assertion mirror setup_optimizer(); IterAdaLN keeps its lower LR.
+        """
+        model_dim = self.config.n_embd
+        dscale = (model_dim / 768) ** -0.5
+        router_ids = self._moe_router_param_ids()
+        adaln_ids = self._adaln_param_ids()
+        block_special = router_ids | adaln_ids
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in block_special]
+        router_params = [p for p in self.transformer.h.parameters() if id(p) in router_ids]
+        adaln_params = [p for p in self.transformer.h.parameters() if id(p) in adaln_ids]
+
+        groups = [
+            dict(params=list(self.lm_head.parameters()), lr=unembedding_lr * dscale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+            dict(params=list(self.transformer.wte.parameters()), lr=embedding_lr * dscale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            dict(params=list(self.value_embeds.parameters()), lr=embedding_lr * dscale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(params=[self.resid_lambdas], lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+            dict(params=[self.x0_lambdas], lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(params=[self.smear_gate.weight, self.smear_lambda, self.backout_lambda], lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(params=matrix_params, lr=matrix_lr * dscale, betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay),
+        ]
+        if router_params:
+            groups.append(dict(params=router_params, lr=matrix_lr * dscale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        if adaln_params:
+            groups.append(dict(params=adaln_params, lr=matrix_lr * dscale * adaln_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+
+        # Partition assertion: every parameter in exactly one group.
+        grouped = [id(p) for g in groups for p in g['params']]
+        assert len(grouped) == len(set(grouped)), "a parameter was assigned to multiple optimizer groups"
+        assert set(grouped) == {id(p) for p in self.parameters()}, "AdamW groups do not partition model parameters"
+
+        optimizer = torch.optim.AdamW(groups, fused=False)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 

@@ -193,6 +193,70 @@ IterAdaLN(h; c) = (1 + gamma(c)) * RMSNorm_affine_free(h) + beta(c)
 
 ---
 
+## Distributed / multi-GPU training
+
+- **Single-GPU:** works out of the box for the small config (`bash runs/loopmoe_small.sh`).
+- **Default multi-GPU (small/medium):** nanochat has **no DDP wrapper**. The `MuonAdamW`
+  optimizer reduces gradients and **shards optimizer state (ZeRO-2)** across ranks itself, with a
+  replicated model. This is the default path and nothing about it regresses. The per-expert MoE
+  token counts are **all-reduced** (`nanochat/gpt.py`) so bias-free balancing and the aux loss
+  see the global load across ranks.
+- **Large (10B+) — sharded path (`--fsdp`):** a replicated 10B+ model + optimizer will not fit,
+  so parameters themselves must be sharded. `--fsdp` applies **PyTorch FSDP2** (`fully_shard`)
+  **per transformer block** (plus embeddings and lm_head), sharding parameters, gradients, and
+  optimizer state. See `nanochat/fsdp_utils.py`.
+  - Under FSDP the optimizer is **plain AdamW** (`GPT.setup_adamw_optimizer`), not Muon: Muon's
+    hand-rolled all-gather/reduce-scatter is incompatible with FSDP's sharded DTensors. Experts
+    therefore train under AdamW here (the task spec explicitly permits this fallback). IterAdaLN
+    keeps its lower LR; the partition assertion still holds.
+  - No `MixedPrecisionPolicy` is attached: nanochat's custom `Linear` already casts weights to
+    the activation dtype in forward, so compute is bf16 regardless. Parameters are made uniform
+    fp32 before sharding (FSDP2 requires uniform dtype per shard group). *TODO: a bf16 param
+    all-gather would cut the large config's communication volume.*
+  - MoE cross-rank reductions use the default process group (shared with FSDP), so load
+    statistics stay global and correct.
+
+Verification on this workstation was limited to a **single GPU**: the FSDP path was exercised
+end-to-end on a 1-rank process group (sharding + AdamW + loop + MoE + IterAdaLN + checkpointing +
+`torch.compile`, loss decreasing), and the default MuonAdamW path on the same. A true multi-rank
+loss-match run requires ≥2 GPUs and was not run here.
+
+---
+
+## Two ready-to-run configs
+
+Both print the full param breakdown (total / active-physical / active-FLOPs / effective depth) at
+startup and mirror `speedrun.sh` style.
+
+### `runs/loopmoe_small.sh` — single-GPU (~0.97B total, ~230M active)
+
+`n_embd=1024` (depth 6 × aspect 170, 8 heads); sandwich loop `2 / 2 / 2` with `K=4` (effective
+depth 12); MoE with 160 routed + 1 shared experts, `top_k=8`, auto expert-hidden 384, bias-free
+balancing; IterAdaLN on. Runs on a single 96 GB GPU. Active params (230M) are well under the
+<500M target while total (~0.97B) approaches the ~1B target.
+
+```
+bash runs/loopmoe_small.sh
+```
+
+### `runs/loopmoe_large.sh` — multi-GPU, FSDP (~10.96B total, ~2.39B active)
+
+`n_embd=2432` (depth 12 × aspect 200, 19 heads); sandwich loop `4 / 4 / 4` with `K=4` (effective
+depth 24); MoE with 144 routed + 2 shared experts, `top_k=6`, auto expert-hidden 1152, bias-free
+balancing; IterAdaLN on; loop-body gradient checkpointing on; `--fsdp`. Total ≥10B is carried by
+the routed-expert pool while active compute stays modest (2.39B).
+
+```
+bash runs/loopmoe_large.sh          # or: torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- ...
+```
+
+> **Speed caveat:** the correctness-first MoE uses a per-expert Python loop (there is a clearly
+> marked TODO for a grouped-GEMM expert kernel). With 144–160 experts this is slow; it is meant to
+> demonstrate a correct, trainable model, not peak throughput. Reduce `--n-routed-experts` while
+> iterating.
+
+---
+
 ## Optimizer wiring summary
 
 | Params | Optimizer group | LR |
@@ -204,6 +268,35 @@ IterAdaLN(h; c) = (1 + gamma(c)) * RMSNorm_affine_free(h) + beta(c)
 
 `setup_optimizer` asserts the groups **partition** all model parameters (each param in exactly
 one group). The `MoE.expert_bias` is a **buffer, not a parameter**, so it is never in any group.
+
+---
+
+## Known pitfalls (and how they're handled here)
+
+- **Router collapse:** default to bias-free balancing; per-expert load and routing entropy are
+  logged every 100 steps (`base_train.py`), so collapse is visible early. The classic aux loss is
+  available as a fallback (`--load-balance-mode aux_loss`).
+- **Every expert must get a gradient:** `MuonAdamW` stacks per-parameter grads, so a `None` grad
+  (an expert that received no tokens) would crash it. `MoE` always invokes every expert (on a
+  possibly-empty token slice) so all expert grads are defined.
+- **Activation memory across K:** loop-body activations scale with `K`; enable
+  `--grad-checkpoint-loop` for the large config. Checkpointed and non-checkpointed runs match in
+  loss and gradients.
+- **Shared-weight gradients:** the loop is never detached; autograd accumulates the tied-weight
+  gradients across the `K` iterations (BPTT).
+- **Bias update under checkpointing:** the bias-free nudge is deferred to
+  `GPT.update_router_bias()` (called once per optimizer step) rather than mutating state inside
+  `forward`, because a shared loop block is recomputed multiple times per step.
+- **IterAdaLN divergence in bf16:** the unbounded modulation needs a **much lower LR** than the
+  matrices — it gets its own AdamW group at `0.1×` the matrix LR. At the full matrix LR it NaNs
+  within a few steps.
+- **AdaLN dead branch:** an adaln loop-body block's attention `c_proj` is given a small non-zero
+  init (not zero) so the zero-init alpha gate has a live gradient path.
+- **`torch.compile` recompiles:** the iteration PE is precomputed into a buffer (not built from a
+  python int in forward); the dynamo cache limit is raised in `optim.py` because LoopMoE adds
+  several new AdamW-group parameter shapes.
+- **FLOPs/param accounting:** `estimate_flops` and `param_report` reflect looped compute (`K×`)
+  and MoE active-vs-total, so MFU/logging numbers stay meaningful.
 
 ---
 
@@ -229,6 +322,7 @@ one group). The `MoE.expert_bias` is a **buffer, not a parameter**, so it is nev
 - IterAdaLN only in the loop body; **near-zero modulation at init** (identity + closed gate);
 - loop body near-identity at init; adaln params → AdamW; no None grads;
 - MoE branch has no alpha gate; checkpoint match; modulation grows during training;
-- optimizer partition holds with adaln present.
+- optimizer partition holds with adaln present;
+- FSDP AdamW optimizer partitions all params, trains, and uses a lower LR for adaln.
 
 Run: `NANOCHAT_DTYPE=float32 python -m pytest tests/test_loopmoe.py -v`
