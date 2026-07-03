@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -37,6 +38,34 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+
+    # --- LoopMoE additions (all default to stock dense nanochat behavior) -----------------
+    # Mixture-of-Experts feed-forward (Change 1). n_routed_experts=0 => dense ReLU^2 MLP.
+    n_routed_experts: int = 0       # number of routed experts (0 disables MoE => dense MLP)
+    n_shared_experts: int = 0       # always-on shared experts added unconditionally
+    top_k: int = 1                  # experts selected per token
+    expert_hidden_dim: int = 0      # per-expert FFN hidden dim (0 => auto: match dense FLOPs)
+    load_balance_mode: str = "bias_free"  # "bias_free" (DeepSeek-V3) or "aux_loss"
+    aux_loss_coef: float = 0.01     # coefficient for the classic aux load-balancing loss
+    router_bias_update_rate: float = 0.001  # bias nudge speed for bias_free balancing
+
+    # Sandwich loop layout (Change 2). n_loop_layers=0 => standard n_layer stack (no loop).
+    n_prefix_layers: int = 0        # Lp: non-shared prefix blocks
+    n_loop_layers: int = 0          # Lb: shared loop-body blocks (0 disables looping)
+    n_suffix_layers: int = 0        # Ls: non-shared suffix blocks
+    loop_iters: int = 1             # K: times the shared loop body is applied
+
+    # IterAdaLN inside the loop body (Change 3).
+    use_iter_adaln: bool = False    # token+iteration conditioned modulation in loop body
+    grad_checkpoint_loop: bool = False  # gradient-checkpoint loop-body executions
+
+    @property
+    def use_moe(self):
+        return self.n_routed_experts > 0
+
+    @property
+    def use_loop(self):
+        return self.n_loop_layers > 0
 
 
 def norm(x):
@@ -138,19 +167,166 @@ class MLP(nn.Module):
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
+        return x, None  # (output, aux_loss); dense MLP never produces an aux loss
+
+
+class Expert(nn.Module):
+    """A single ReLU^2 FFN, identical in spirit to MLP but with a configurable hidden dim.
+    Kept as its own class so the router/MoE code reads cleanly and so init is explicit."""
+    def __init__(self, n_embd, hidden_dim):
+        super().__init__()
+        self.c_fc = Linear(n_embd, hidden_dim, bias=False)
+        self.c_proj = Linear(hidden_dim, n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
         return x
+
+
+def moe_expert_hidden_dim(config):
+    """Resolve the per-expert hidden dim. If expert_hidden_dim==0, auto-size so that the
+    per-token FFN compute (top_k routed + shared experts) roughly matches the dense 4*n_embd
+    MLP it replaces: dense hidden = 4*n_embd spread over (top_k + n_shared) active experts."""
+    if config.expert_hidden_dim > 0:
+        return config.expert_hidden_dim
+    active = max(1, config.top_k + config.n_shared_experts)
+    h = (4 * config.n_embd) // active
+    return max(1, (h // 128) * 128)  # round down to a tensor-core-friendly multiple of 128
+
+
+class MoE(nn.Module):
+    """DeepSeekMoE-style Mixture-of-Experts feed-forward layer (LoopMoE Change 1).
+
+    - n_routed_experts independent ReLU^2 FFNs; a token is routed to its top_k experts.
+    - Router: single Linear(n_embd, n_routed_experts) -> softmax affinities; top_k selected,
+      outputs combined by the (renormalized) softmax weights of the chosen experts.
+    - n_shared_experts always-on FFNs added unconditionally.
+    - Load balancing: default is DeepSeek-V3's auxiliary-loss-free per-expert bias that nudges
+      the *selection* logits toward balanced load (the combine weights still use the raw
+      softmax affinity). An optional classic aux load-balancing loss is available via config.
+
+    Correctness-first implementation: a plain Python for-loop over experts. Every expert is
+    always invoked (on a possibly-empty token slice) so that every expert weight receives a
+    gradient each step -- required because nanochat's optimizer stacks per-param grads and a
+    None grad would break it. This routing is data-dependent, so forward is excluded from
+    torch.compile.
+    TODO: replace the per-expert loop with a batched/grouped-GEMM expert path for speed.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_routed_experts = config.n_routed_experts
+        self.n_shared_experts = config.n_shared_experts
+        self.top_k = config.top_k
+        self.load_balance_mode = config.load_balance_mode
+        self.aux_loss_coef = config.aux_loss_coef
+        self.bias_update_rate = config.router_bias_update_rate
+        assert self.top_k <= self.n_routed_experts, "top_k cannot exceed n_routed_experts"
+        assert self.load_balance_mode in ("bias_free", "aux_loss")
+        hidden = moe_expert_hidden_dim(config)
+        self.expert_hidden_dim = hidden
+        self.router = Linear(config.n_embd, config.n_routed_experts, bias=False)
+        self.experts = nn.ModuleList([Expert(config.n_embd, hidden) for _ in range(config.n_routed_experts)])
+        self.shared_experts = nn.ModuleList([Expert(config.n_embd, hidden) for _ in range(config.n_shared_experts)])
+        # Per-expert selection bias for the auxiliary-loss-free balancing strategy.
+        # Not a leaf we optimize with SGD: it is nudged manually (see _update_bias). Persistent
+        # so it survives checkpoint save/resume.
+        self.register_buffer("expert_bias", torch.zeros(config.n_routed_experts), persistent=True)
+        # Instrumentation (detached, for logging only; filled each training forward).
+        self.register_buffer("last_load", torch.zeros(config.n_routed_experts), persistent=False)
+        self.last_entropy = 0.0
+
+    @torch.compiler.disable
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.reshape(-1, C)  # (N, C) with N = B*T tokens
+
+        # Router affinities. softmax over experts, per the task spec.
+        logits = self.router(x_flat).float()          # (N, E) in fp32 for stable routing math
+        probs = F.softmax(logits, dim=-1)              # (N, E) combine affinities
+
+        # Top-k selection. bias_free adds a per-expert bias to the *selection* score only.
+        if self.load_balance_mode == "bias_free":
+            select_score = probs + self.expert_bias.float()
+        else:
+            select_score = probs
+        topk_val, topk_idx = torch.topk(select_score, self.top_k, dim=-1)  # (N, k)
+        # Combine weights come from the raw affinity (not the biased score), renormalized over k.
+        weights = probs.gather(1, topk_idx)                                # (N, k)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        weights = weights.to(x.dtype)
+
+        # Dispatch. Loop over experts; each processes the tokens routed to it. We always call
+        # every expert (empty slice -> zero grad, not None) to keep all expert grads defined.
+        y = torch.zeros_like(x_flat)
+        # one-hot-ish assignment mask per expert: (N,) bool for whether expert e is in a token's top-k
+        # and the corresponding combine weight for that token.
+        counts = torch.zeros(self.n_routed_experts, device=x.device, dtype=torch.float32)
+        for e, expert in enumerate(self.experts):
+            sel = (topk_idx == e)                       # (N, k) where this expert was chosen
+            tok_mask = sel.any(dim=-1)                  # (N,)
+            idx = tok_mask.nonzero(as_tuple=True)[0]    # token indices routed to expert e
+            counts[e] = idx.numel()
+            xe = x_flat.index_select(0, idx)            # (n_e, C); may be empty
+            oe = expert(xe)                             # (n_e, C); empty-safe, grad stays defined
+            # weight for expert e at each of its tokens: pick the matching top-k slot
+            we = (weights * sel.to(weights.dtype)).sum(dim=-1)  # (N,)
+            we = we.index_select(0, idx).unsqueeze(-1)          # (n_e, 1)
+            y.index_add_(0, idx, oe * we)
+
+        # Shared experts: always-on, added unconditionally to every token.
+        for expert in self.shared_experts:
+            y = y + expert(x_flat)
+
+        # --- Load balancing bookkeeping ---------------------------------------------------
+        aux = None
+        if self.training:
+            # Sync token counts across ranks so bias/aux see the global load (nanochat runs
+            # data-parallel without a DDP wrapper; grads are reduced in the optimizer).
+            global_counts = counts
+            if dist.is_available() and dist.is_initialized():
+                global_counts = counts.clone()
+                dist.all_reduce(global_counts, op=dist.ReduceOp.SUM)
+            self.last_load = (global_counts / global_counts.sum().clamp_min(1)).detach()
+            # routing entropy (higher = more spread out); cheap collapse detector
+            mean_p = probs.mean(dim=0)
+            self.last_entropy = float(-(mean_p * (mean_p + 1e-9).log()).sum().detach())
+
+            if self.load_balance_mode == "bias_free":
+                self._update_bias(global_counts)
+            else:
+                # Classic Switch-Transformer aux loss: E * sum_i f_i * P_i, encourages the
+                # fraction of tokens f_i and mean routing prob P_i to both be ~1/E (balanced).
+                f_i = global_counts / global_counts.sum().clamp_min(1)     # (E,)
+                P_i = probs.mean(dim=0)                                     # (E,)
+                aux = self.n_routed_experts * (f_i * P_i).sum()
+
+        return y.view(B, T, C), aux
+
+    @torch.no_grad()
+    def _update_bias(self, global_counts):
+        """DeepSeek-V3 aux-loss-free update: nudge each expert's selection bias by the sign of
+        its load error (underloaded experts get a positive nudge, overloaded a negative one)."""
+        load = global_counts / global_counts.sum().clamp_min(1)
+        target = 1.0 / self.n_routed_experts
+        err = target - load                       # >0 => underloaded => raise its bias
+        self.expert_bias += self.bias_update_rate * torch.sign(err)
 
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        # Feed-forward is either the dense ReLU^2 MLP or the MoE layer. Both return (out, aux).
+        self.mlp = MoE(config) if config.use_moe else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        ff_out, aux = self.mlp(norm(x))
+        x = x + ff_out
+        return x, aux
 
 
 class GPT(nn.Module):
@@ -174,6 +350,13 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
+        # Execution schedule: list of (unique_block_idx, iter_k). For the stock (non-looped)
+        # model this is simply each unique block once. For the sandwich loop it is
+        # prefix once + loop-body K times (shared weights) + suffix once (LoopMoE Change 2).
+        # Per-block machinery (window sizes, resid/x0 scalars, value embeddings) is indexed by
+        # the UNIQUE block index, so the number of unique parameters is independent of K.
+        self.exec_schedule = self._build_exec_schedule(config)
+        self.n_exec = len(self.exec_schedule)  # effective depth = number of block executions
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -228,8 +411,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, MoE):
+                self._init_moe(block.mlp, s)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -266,6 +452,20 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+
+    @torch.no_grad()
+    def _init_moe(self, moe, s):
+        """Initialize an MoE block. Experts mirror the dense MLP init (c_fc uniform at 0.4x
+        scale, c_proj zeros so each expert starts as a near-identity residual). The router gets
+        a small normal init to lightly break symmetry while starting near-uniform routing.
+        Buffers (expert_bias, last_load) are created on the meta device, so they hold garbage
+        after to_empty() and must be explicitly zeroed here."""
+        torch.nn.init.normal_(moe.router.weight, mean=0.0, std=0.02)
+        for expert in list(moe.experts) + list(moe.shared_experts):
+            torch.nn.init.uniform_(expert.c_fc.weight, -s * 0.4, s * 0.4)
+            torch.nn.init.zeros_(expert.c_proj.weight)
+        moe.expert_bias.zero_()
+        moe.last_load.zero_()
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -313,6 +513,38 @@ class GPT(nn.Module):
         window_sizes[-1] = (long_window, 0)
         return window_sizes
 
+    def _build_exec_schedule(self, config):
+        """Build the block execution schedule as a list of (unique_block_idx, iter_k).
+
+        Non-looped: [(0,0), (1,0), ..., (n_layer-1, 0)] -- reduces exactly to the stock stack.
+        Looped (LoopMoE Change 2, no prefix re-injection):
+            prefix blocks [0, Lp)            run once
+            loop-body blocks [Lp, Lp+Lb)     run K times with the SAME shared weights
+            suffix blocks [Lp+Lb, Lp+Lb+Ls)  run once
+        Effective depth = Lp + K*Lb + Ls; unique layers = Lp + Lb + Ls == n_layer.
+        """
+        if not config.use_loop:
+            return [(i, 0) for i in range(config.n_layer)]
+        Lp, Lb, Ls, K = config.n_prefix_layers, config.n_loop_layers, config.n_suffix_layers, config.loop_iters
+        n_unique = Lp + Lb + Ls
+        assert n_unique == config.n_layer, (
+            f"When looping, n_layer ({config.n_layer}) must equal "
+            f"n_prefix_layers+n_loop_layers+n_suffix_layers ({Lp}+{Lb}+{Ls}={n_unique})"
+        )
+        assert K >= 1, "loop_iters (K) must be >= 1"
+        schedule = [(i, 0) for i in range(Lp)]                          # prefix, once
+        for k in range(K):                                             # loop body, K times
+            schedule += [(Lp + j, k) for j in range(Lb)]
+        schedule += [(Lp + Lb + i, 0) for i in range(Ls)]              # suffix, once
+        return schedule
+
+    def loop_body_range(self):
+        """(start, end) unique-block indices of the shared loop body, or None if not looping."""
+        if not self.config.use_loop:
+            return None
+        Lp, Lb = self.config.n_prefix_layers, self.config.n_loop_layers
+        return (Lp, Lp + Lb)
+
     def get_device(self):
         return self.transformer.wte.weight.device
 
@@ -328,21 +560,69 @@ class GPT(nn.Module):
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
-        nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+        # Sum the matmul params actually engaged per token, walking the execution schedule.
+        # This correctly reflects (a) looped compute: a shared block counts once per execution
+        # (K times), and (b) MoE: only the top_k routed + shared experts run, not the full pool.
+        matmul_numel = self.lm_head.weight.numel()  # unembedding runs once per token
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
+        for block_idx, _k in self.exec_schedule:
+            block = self.transformer.h[block_idx]
+            matmul_numel += self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+            window = self.window_sizes[block_idx][0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        num_flops_per_token = 6 * matmul_numel + attn_flops
         return num_flops_per_token
+
+    def _attn_matmul_numel(self, block):
+        """Number of attention matmul weights in a block (always active per token)."""
+        a = block.attn
+        n = a.c_q.weight.numel() + a.c_k.weight.numel() + a.c_v.weight.numel() + a.c_proj.weight.numel()
+        if a.ve_gate is not None:
+            n += a.ve_gate.weight.numel()
+        return n
+
+    def _active_ffn_numel(self, block):
+        """Feed-forward matmul weights active per token: dense MLP -> both matrices; MoE ->
+        the router plus (top_k routed + shared) experts, i.e. active params, not the full pool."""
+        mlp = block.mlp
+        if isinstance(mlp, MoE):
+            per_expert = self.config.n_embd * mlp.expert_hidden_dim * 2  # c_fc + c_proj
+            active_experts = mlp.top_k + mlp.n_shared_experts
+            return mlp.router.weight.numel() + active_experts * per_expert
+        return mlp.c_fc.weight.numel() + mlp.c_proj.weight.numel()
+
+    def param_report(self):
+        """Parameter-count breakdown for logging, distinguishing total vs active (the point of
+        MoE + looping). Returns:
+        - total_params: every unique weight in the model.
+        - active_params_physical: unique weights engaged per token, counting a shared loop block
+          only ONCE even if it runs K times (attention/FFN 'physical' footprint).
+        - active_params_flops: weights engaged per token counting each execution (K x for loop
+          body) -- this is what drives FLOPs/MFU.
+        - effective_depth (n_exec), unique_layers (n_layer).
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        embed_active = self.config.n_embd  # one embedding row per token (lookup)
+        # flops-active: walk the schedule (K executions counted)
+        active_flops = self.lm_head.weight.numel() + embed_active
+        for block_idx, _k in self.exec_schedule:
+            block = self.transformer.h[block_idx]
+            active_flops += self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+        # physical-active: each unique executed block counted once
+        unique_used = sorted({b for b, _k in self.exec_schedule})
+        active_physical = self.lm_head.weight.numel() + embed_active
+        for block_idx in unique_used:
+            block = self.transformer.h[block_idx]
+            active_physical += self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+        return {
+            'total_params': total_params,
+            'active_params_physical': active_physical,
+            'active_params_flops': active_flops,
+            'effective_depth': self.n_exec,
+            'unique_layers': self.config.n_layer,
+        }
 
     def num_scaling_params(self):
         """
@@ -373,18 +653,41 @@ class GPT(nn.Module):
             'total': total,
         }
 
+    def _moe_router_param_ids(self):
+        """ids of router weights: these are classifier-like and go to AdamW, not Muon."""
+        ids = set()
+        for m in self.modules():
+            if isinstance(m, MoE):
+                ids.add(id(m.router.weight))
+        return ids
+
+    def _adaln_param_ids(self):
+        """ids of IterAdaLN / iteration-MLP params: small conditioning nets -> AdamW, not Muon.
+        Matched by name so this is robust to the module being added in a later milestone."""
+        ids = set()
+        for name, p in self.transformer.h.named_parameters():
+            if "adaln" in name or "iter_mlp" in name:
+                ids.add(id(p))
+        return ids
+
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
 
-        # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Route parameters inside the transformer blocks. Attention matrices and MoE expert
+        # matrices (2D matmul weights) -> Muon. Router weights and IterAdaLN conditioning nets
+        # -> AdamW (per the task spec: routers/modulation MLPs are not Muon-appropriate).
+        router_ids = self._moe_router_param_ids()
+        adaln_ids = self._adaln_param_ids()
+        adamw_block_ids = router_ids | adaln_ids
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in adamw_block_ids]
+        adamw_block_params = [p for p in self.transformer.h.parameters() if id(p) in adamw_block_ids]
+
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -400,6 +703,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # AdamW group for router + IterAdaLN params (only present when MoE/loop-adaln enabled)
+        if adamw_block_params:
+            param_groups.append(dict(kind='adamw', params=adamw_block_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -407,6 +713,17 @@ class GPT(nn.Module):
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
+
+        # Partition assertion: every model parameter lands in exactly one optimizer group.
+        grouped_ids = [id(p) for g in param_groups for p in g['params']]
+        all_ids = [id(p) for p in self.parameters()]
+        assert len(grouped_ids) == len(set(grouped_ids)), "a parameter was assigned to multiple optimizer groups"
+        assert set(grouped_ids) == set(all_ids), (
+            f"optimizer groups do not partition model parameters: "
+            f"{len(set(all_ids) - set(grouped_ids))} params ungrouped, "
+            f"{len(set(grouped_ids) - set(all_ids))} stray"
+        )
+        assert len(grouped_ids) == len(all_ids), "parameter count mismatch across optimizer groups"
 
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
@@ -453,10 +770,13 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        aux_loss_total = None  # accumulated MoE auxiliary load-balancing loss (aux_loss mode)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x, aux = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if aux is not None:
+                aux_loss_total = aux if aux_loss_total is None else aux_loss_total + aux
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -475,6 +795,10 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Add the MoE auxiliary load-balancing loss (only populated in aux_loss mode; the
+            # default bias_free strategy returns no aux loss, so this is zero-cost when disabled).
+            if aux_loss_total is not None:
+                loss = loss + self.config.aux_loss_coef * aux_loss_total.to(loss.dtype)
             return loss
         else:
             # inference: just return the logits directly
