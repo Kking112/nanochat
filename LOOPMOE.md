@@ -12,8 +12,8 @@ Everything is off by default: with the default config you get **exactly stock na
 (dense MLP, standard stack, standard RMSNorm). Turn features on via `GPTConfig` fields (and
 the matching `scripts/base_train.py` CLI flags).
 
-> Status of this document: **Change 1 (MoE) implemented and tested.** Changes 2–3 and the
-> large-config sharding are added in subsequent milestones and documented as they land.
+> Status: **Changes 1–3 (MoE, sandwich loop, IterAdaLN) implemented and tested.** The large-config
+> FSDP sharding path and the two ready-to-run config scripts are documented below.
 
 ---
 
@@ -140,6 +140,73 @@ counted once), FLOPs-active params (loop body counted `K×`), and effective vs u
 
 ---
 
+## Change 3 — IterAdaLN (breaks weight-sharing symmetry)
+
+Inside the **loop body only**, each pre-normalization RMSNorm is replaced with **IterAdaLN**:
+an affine-free RMSNorm followed by token- and iteration-conditioned modulation. This lets each
+loop iteration behave differently despite sharing weights.
+
+For token `t` at iteration `k`, a branch-specific condition vector fuses a token stream and an
+iteration stream (broadcast add):
+
+```
+c = adaln_token_proj(hidden_state_t) + adaln_iter_mlp(sinusoidal_PE(k))
+IterAdaLN(h; c) = (1 + gamma(c)) * RMSNorm_affine_free(h) + beta(c)
+```
+
+- **Token stream:** a linear projection of the current per-token hidden state. The attention
+  branch conditions on the block **input** state `h`; the MoE branch conditions on the
+  **post-attention** state `m`.
+- **Iteration stream:** a DiT-style fixed sinusoidal PE of the iteration index `k`, passed
+  through a small learnable MLP (`adaln_iter_mlp`). The PE table is **precomputed once** as a
+  buffer and indexed by `k` (rather than built from a Python int inside `forward`), so
+  `torch.compile` does not recompile per iteration.
+- **AdaLN-Zero:** `gamma`, `beta`, and (attention branch only) a residual gate `alpha` come from
+  **zero-initialized** output heads, so the loop starts as near-identity and differentiates
+  during training. Updates:
+  ```
+  m     = h + alpha * Attn(IterAdaLN(h; c_attn))   # attention branch: GATED
+  h_out = m +         MoE (IterAdaLN(m; c_moe))     # MoE branch: NO gate
+  ```
+  The gate is on the **attention branch only** — a symmetric gate on the MoE branch would be
+  absorbed into the routing weights and interfere with load balancing.
+- Affine-free RMSNorm (nanochat's `norm`) supplies no static scale; IterAdaLN supplies the
+  dynamic one. Prefix and suffix blocks keep standard normalization.
+
+**Implementation details / gotchas**
+
+- nanochat's custom `Linear` is **bias-free by design** (it overrides `forward` and never applies
+  a bias), so all IterAdaLN layers are `bias=False`. AdaLN-Zero still works by zeroing the head
+  **weights** (zero output at init).
+- **Dead-branch avoidance:** the attention `c_proj` in an adaln loop-body block is **not**
+  zero-initialized (it uses a small 0.4× init). If both `c_proj` and the `alpha` gate were zero,
+  neither would ever receive a gradient (the branch would be permanently dead). A small non-zero
+  `c_proj` keeps the branch alive while the zero `alpha` keeps it near-identity at init.
+- **AdaLN needs a lower LR (important):** the modulation `(1+gamma)`/`beta` and the `alpha` gate
+  are unbounded; at nanochat's matrix LR they diverge in bf16 within a few steps. IterAdaLN
+  params therefore get their **own AdamW group at `0.1×` the matrix LR** (`ADALN_LR_SCALE` in
+  `setup_optimizer`). MoE routers keep the full matrix LR (stable). This was necessary to make
+  bf16 training on the GPU stable — verified empirically.
+- All IterAdaLN params (token proj, iter MLP, gamma/beta/alpha heads) → **AdamW**, never Muon.
+
+**Turning it on/off:** `use_iter_adaln=True` (requires a loop, i.e. `n_loop_layers>0`).
+
+---
+
+## Optimizer wiring summary
+
+| Params | Optimizer group | LR |
+|---|---|---|
+| Attention + MoE **expert** matrices (`c_fc`/`c_proj`) | Muon | `matrix_lr` |
+| MoE **router** | AdamW | `matrix_lr · dscale` |
+| **IterAdaLN** (token proj, iter MLP, gamma/beta/alpha) | AdamW | `matrix_lr · dscale · 0.1` |
+| Embeddings, lm_head, value embeds, scalars | AdamW | (unchanged from stock) |
+
+`setup_optimizer` asserts the groups **partition** all model parameters (each param in exactly
+one group). The `MoE.expert_bias` is a **buffer, not a parameter**, so it is never in any group.
+
+---
+
 ## Tests
 
 `tests/test_loopmoe.py` (CPU, fp32 — no GPU needed):
@@ -158,6 +225,10 @@ counted once), FLOPs-active params (loop body counted `K×`), and effective vs u
 - **checkpointed == non-checkpointed** loss and grads (dense + MoE loop bodies);
 - bias nudge applies exactly once under checkpointing;
 - **looped KV-cache inference == full forward**;
-- looped-MoE overfits a fixed batch.
+- looped-MoE overfits a fixed batch;
+- IterAdaLN only in the loop body; **near-zero modulation at init** (identity + closed gate);
+- loop body near-identity at init; adaln params → AdamW; no None grads;
+- MoE branch has no alpha gate; checkpoint match; modulation grows during training;
+- optimizer partition holds with adaln present.
 
 Run: `NANOCHAT_DTYPE=float32 python -m pytest tests/test_loopmoe.py -v`

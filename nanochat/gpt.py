@@ -335,16 +335,99 @@ class MoE(nn.Module):
         self.expert_bias += self.bias_update_rate * torch.sign(err)
 
 
+def sinusoidal_iter_embedding(k, dim, device, dtype):
+    """DiT-style fixed sinusoidal positional encoding of the (scalar) iteration index k.
+    Returns a (dim,) tensor. k is a Python int (constant per unrolled loop iteration)."""
+    half = dim // 2
+    # frequencies spaced geometrically, same convention as diffusion timestep embeddings
+    freqs = torch.exp(-torch.arange(half, device=device, dtype=torch.float32) * (torch.log(torch.tensor(10000.0)) / half))
+    args = k * freqs
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:  # pad if odd
+        emb = torch.cat([emb, torch.zeros(1, device=device, dtype=torch.float32)], dim=-1)
+    return emb.to(dtype)
+
+
+class IterAdaLN(nn.Module):
+    """Iteration- and token-conditioned modulation for the loop body (LoopMoE Change 3).
+
+    Replaces a pre-norm RMSNorm with:  (1 + gamma(c)) * RMSNorm_affine_free(h) + beta(c),
+    where the condition fuses a token stream and an iteration stream (broadcast add):
+        c = token_proj(hidden_state) + iter_mlp(sinusoidal_PE(k))
+    gamma/beta (and, for the attention branch only, a residual gate alpha) come from
+    zero-initialized output heads (AdaLN-Zero), so the loop starts as near-identity and
+    differentiates during training.
+
+    `gate=True` builds the attention-branch alpha gate; `gate=False` (MoE branch) omits it
+    (per the paper: a symmetric gate on the MoE branch is absorbed into routing weights and
+    interferes with load balancing).
+    """
+    PE_DIM = 128  # dimensionality of the sinusoidal iteration embedding
+
+    def __init__(self, config, gate):
+        super().__init__()
+        n_embd = config.n_embd
+        cond = n_embd
+        self.gate = gate
+        # NOTE: nanochat's custom Linear is bias-free by design (it overrides forward and never
+        # applies a bias), so every layer here is bias=False. AdaLN-Zero still works: zero-init
+        # the head *weights* and the modulation output is zero at init (identity), differentiating
+        # as the weights learn.
+        # token stream: project the current per-token hidden state into the condition space
+        self.adaln_token_proj = Linear(n_embd, cond, bias=False)
+        # iteration stream: small MLP over the sinusoidal PE of the iteration index
+        self.adaln_iter_mlp = nn.Sequential(
+            Linear(self.PE_DIM, cond, bias=False),
+            nn.SiLU(),
+            Linear(cond, cond, bias=False),
+        )
+        # AdaLN-Zero output heads (zero-initialized): shift (beta), scale (gamma), gate (alpha)
+        self.adaln_gamma = Linear(cond, n_embd, bias=False)
+        self.adaln_beta = Linear(cond, n_embd, bias=False)
+        self.adaln_alpha = Linear(cond, n_embd, bias=False) if gate else None
+
+    def forward(self, h, pe):
+        # pe: precomputed sinusoidal PE of the iteration index, shape (PE_DIM,). Passed in (not
+        # computed here from a python int) so torch.compile does not specialize/recompile per k.
+        # condition = token stream (per token) + iteration stream (broadcast over tokens)
+        c = self.adaln_token_proj(h) + self.adaln_iter_mlp(pe.to(h.dtype))      # (B,T,cond)
+        c = F.silu(c)
+        gamma = self.adaln_gamma(c)
+        beta = self.adaln_beta(c)
+        out = (1 + gamma) * norm(h) + beta  # affine-free RMSNorm, dynamically modulated
+        if self.gate:
+            alpha = self.adaln_alpha(c)
+            return out, alpha
+        return out
+
+
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, is_loop_body=False):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         # Feed-forward is either the dense ReLU^2 MLP or the MoE layer. Both return (out, aux).
         self.mlp = MoE(config) if config.use_moe else MLP(config)
+        # IterAdaLN lives in the loop body only; prefix/suffix keep standard normalization.
+        self.is_loop_body = is_loop_body
+        self.use_adaln = is_loop_body and config.use_iter_adaln
+        if self.use_adaln:
+            self.adaln_attn = IterAdaLN(config, gate=True)   # attention branch: gated
+            self.adaln_moe = IterAdaLN(config, gate=False)   # MoE/FFN branch: no gate
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, kv_layer_idx=None, iter_k=0):
-        # iter_k is the loop iteration index (0 for non-loop / prefix / suffix); it is unused
-        # by the standard block and consumed by IterAdaLN inside the loop body (Change 3).
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, kv_layer_idx=None, iter_pe=None):
+        # iter_pe is the precomputed sinusoidal PE of the loop iteration index (None for
+        # non-loop / prefix / suffix). Consumed by IterAdaLN in the loop body (Change 3);
+        # ignored by prefix/suffix/standard blocks.
+        if self.use_adaln:
+            # Attention branch (gated): m = h + alpha * Attn(IterAdaLN(h; c_attn)).
+            # Token stream for c_attn uses the block INPUT state h.
+            h_normed, alpha = self.adaln_attn(x, iter_pe)
+            m = x + alpha * self.attn(h_normed, ve, cos_sin, window_size, kv_cache, kv_layer_idx)
+            # MoE branch (ungated): h_out = m + MoE(IterAdaLN(m; c_moe)).
+            # Token stream for c_moe uses the post-attention state m.
+            ff_out, aux = self.mlp(self.adaln_moe(m, iter_pe))
+            return m + ff_out, aux
+        # Standard pre-norm block (prefix, suffix, or non-looped stack)
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, kv_layer_idx)
         ff_out, aux = self.mlp(norm(x))
         x = x + ff_out
@@ -368,9 +451,16 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        # Which unique blocks form the shared loop body (they get IterAdaLN when enabled).
+        _lb = None
+        if config.use_loop:
+            _lb = (config.n_prefix_layers, config.n_prefix_layers + config.n_loop_layers)
+        def _is_loop_body(i):
+            return _lb is not None and _lb[0] <= i < _lb[1]
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, layer_idx, is_loop_body=_is_loop_body(layer_idx))
+                                for layer_idx in range(config.n_layer)]),
         })
         # Execution schedule: list of (unique_block_idx, iter_k). For the stock (non-looped)
         # model this is simply each unique block once. For the sandwich loop it is
@@ -405,6 +495,15 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
+        # Precomputed sinusoidal iteration positional encodings for IterAdaLN, one row per loop
+        # iteration. Precomputing (rather than building from a python int inside forward) keeps
+        # torch.compile from specializing/recompiling per iteration index. Filled in init_weights.
+        if config.use_iter_adaln and config.use_loop:
+            iter_pe = torch.zeros(config.loop_iters, IterAdaLN.PE_DIM)
+            self.register_buffer("iter_pe", iter_pe, persistent=False)
+        else:
+            self.iter_pe = None
+
     @torch.no_grad()
     def init_weights(self):
         """
@@ -432,12 +531,23 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.use_adaln:
+                # The attention branch is scaled by a zero-initialized alpha gate (AdaLN-Zero),
+                # so c_proj must NOT also be zero -- both zero would make the branch dead (no
+                # gradient reaches either). Use a SMALL non-zero init (0.4x): large enough to keep
+                # the branch alive, small enough that the first gradient into the zero alpha gate
+                # (which is proportional to the attention output magnitude) does not blow up.
+                torch.nn.init.uniform_(block.attn.c_proj.weight, -s * 0.4, s * 0.4)
+            else:
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero (residual-zero init)
             if isinstance(block.mlp, MoE):
                 self._init_moe(block.mlp, s)
             else:
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.use_adaln:
+                self._init_adaln(block.adaln_attn)
+                self._init_adaln(block.adaln_moe)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -467,6 +577,14 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
+        # Fill the sinusoidal iteration PE table for IterAdaLN (adaln nets are inited in the
+        # per-block loop above). One row per loop iteration, cast to the compute dtype.
+        if self.iter_pe is not None:
+            device = self.transformer.wte.weight.device
+            rows = [sinusoidal_iter_embedding(k, IterAdaLN.PE_DIM, device, torch.float32)
+                    for k in range(self.config.loop_iters)]
+            self.iter_pe = torch.stack(rows, dim=0).to(COMPUTE_DTYPE)
+
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
         # because GradScaler cannot unscale fp16 gradients.
@@ -488,6 +606,26 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(expert.c_proj.weight)
         moe.expert_bias.zero_()
         moe.last_load.zero_()
+
+    @torch.no_grad()
+    def _init_adaln(self, adaln):
+        """Initialize an IterAdaLN module (AdaLN-Zero). The output heads (gamma/beta/alpha) are
+        ZERO so the modulation starts as the identity ((1+0)*norm(h)+0) and the alpha gate starts
+        closed, i.e. the loop body begins as near-identity and differentiates during training.
+        The conditioning nets (token_proj, iter_mlp) get small non-zero inits so a gradient
+        signal exists once the zero heads start to move."""
+        n_embd = self.config.n_embd
+        s = 3**0.5 * n_embd**-0.5
+        torch.nn.init.uniform_(adaln.adaln_token_proj.weight, -s * 0.4, s * 0.4)
+        for layer in adaln.adaln_iter_mlp:
+            if isinstance(layer, nn.Linear):
+                # iter_mlp maps PE_DIM -> cond; scale by its own input dim, not n_embd
+                si = 3**0.5 * layer.weight.shape[1] ** -0.5
+                torch.nn.init.uniform_(layer.weight, -si * 0.4, si * 0.4)
+        # AdaLN-Zero: zero the output head weights (bias-free) so modulation starts at identity
+        for head in (adaln.adaln_gamma, adaln.adaln_beta, adaln.adaln_alpha):
+            if head is not None:
+                torch.nn.init.zeros_(head.weight)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -606,7 +744,8 @@ class GPT(nn.Module):
         attn_flops = 0
         for block_idx, _k in self.exec_schedule:
             block = self.transformer.h[block_idx]
-            matmul_numel += self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+            matmul_numel += (self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+                             + self._adaln_matmul_numel(block))
             window = self.window_sizes[block_idx][0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
@@ -619,6 +758,19 @@ class GPT(nn.Module):
         n = a.c_q.weight.numel() + a.c_k.weight.numel() + a.c_v.weight.numel() + a.c_proj.weight.numel()
         if a.ve_gate is not None:
             n += a.ve_gate.weight.numel()
+        return n
+
+    def _adaln_matmul_numel(self, block):
+        """Per-token IterAdaLN matmul weights (token projection + gamma/beta/alpha heads). The
+        iteration MLP runs once per iteration, not per token, so it is omitted here."""
+        if not getattr(block, "use_adaln", False):
+            return 0
+        n = 0
+        for adaln in (block.adaln_attn, block.adaln_moe):
+            n += adaln.adaln_token_proj.weight.numel()
+            n += adaln.adaln_gamma.weight.numel() + adaln.adaln_beta.weight.numel()
+            if adaln.adaln_alpha is not None:
+                n += adaln.adaln_alpha.weight.numel()
         return n
 
     def _active_ffn_numel(self, block):
@@ -647,13 +799,15 @@ class GPT(nn.Module):
         active_flops = self.lm_head.weight.numel() + embed_active
         for block_idx, _k in self.exec_schedule:
             block = self.transformer.h[block_idx]
-            active_flops += self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+            active_flops += (self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+                             + self._adaln_matmul_numel(block))
         # physical-active: each unique executed block counted once
         unique_used = sorted({b for b, _k in self.exec_schedule})
         active_physical = self.lm_head.weight.numel() + embed_active
         for block_idx in unique_used:
             block = self.transformer.h[block_idx]
-            active_physical += self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+            active_physical += (self._attn_matmul_numel(block) + self._active_ffn_numel(block)
+                                + self._adaln_matmul_numel(block))
         return {
             'total_params': total_params,
             'active_params_physical': active_physical,
@@ -718,7 +872,8 @@ class GPT(nn.Module):
         adaln_ids = self._adaln_param_ids()
         adamw_block_ids = router_ids | adaln_ids
         matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in adamw_block_ids]
-        adamw_block_params = [p for p in self.transformer.h.parameters() if id(p) in adamw_block_ids]
+        router_params = [p for p in self.transformer.h.parameters() if id(p) in router_ids]
+        adaln_params = [p for p in self.transformer.h.parameters() if id(p) in adaln_ids]
 
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -741,9 +896,16 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # AdamW group for router + IterAdaLN params (only present when MoE/loop-adaln enabled)
-        if adamw_block_params:
-            param_groups.append(dict(kind='adamw', params=adamw_block_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        # AdamW group for the MoE routers (classifier-like; full matrix LR is stable for them).
+        if router_params:
+            param_groups.append(dict(kind='adamw', params=router_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        # AdamW group for IterAdaLN conditioning nets + AdaLN-Zero heads. These are given a much
+        # LOWER LR (ADALN_LR_SCALE x the matrix LR): the modulation (1+gamma)/beta and the alpha
+        # gate are unbounded, and at the matrix LR they diverge in bf16 within a few steps. A
+        # conservative LR keeps the near-identity loop body differentiating smoothly. Tunable.
+        ADALN_LR_SCALE = 0.1
+        if adaln_params:
+            param_groups.append(dict(kind='adamw', params=adaln_params, lr=matrix_lr * dmodel_lr_scale * ADALN_LR_SCALE, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -824,13 +986,15 @@ class GPT(nn.Module):
             block = self.transformer.h[bi]
             window = self.window_sizes[bi]
             is_loop_body = loop_range is not None and loop_range[0] <= bi < loop_range[1]
+            # IterAdaLN iteration PE row for this loop iteration (None unless adaln loop body)
+            iter_pe = self.iter_pe[iter_k] if (self.iter_pe is not None and is_loop_body) else None
             if do_ckpt and is_loop_body:
                 # non-reentrant checkpoint: recomputes this block's forward in backward to save
                 # activation memory; autograd still accumulates the shared-weight grads over K.
                 x, aux = torch.utils.checkpoint.checkpoint(
-                    block, x, ve, cos_sin, window, kv_cache, pos, iter_k, use_reentrant=False)
+                    block, x, ve, cos_sin, window, kv_cache, pos, iter_pe, use_reentrant=False)
             else:
-                x, aux = block(x, ve, cos_sin, window, kv_cache, pos, iter_k)
+                x, aux = block(x, ve, cos_sin, window, kv_cache, pos, iter_pe)
             if aux is not None:
                 aux_loss_total = aux if aux_loss_total is None else aux_loss_total + aux
             if pos == backout_pos:

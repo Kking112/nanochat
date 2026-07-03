@@ -330,3 +330,111 @@ def test_looped_moe_overfits_fixed_batch():
         if step == 0:
             first = loss.item()
     assert loss.item() < first * 0.6, f"looped MoE did not learn: {first:.3f} -> {loss.item():.3f}"
+
+
+# ======================================================================================
+# Change 3 — IterAdaLN
+# ======================================================================================
+def test_adaln_only_in_loop_body():
+    m, cfg = build(use_iter_adaln=True, **LOOP_KW)
+    flags = [b.use_adaln for b in m.transformer.h]
+    # LOOP_KW: Lp=1, Lb=2, Ls=1 -> only blocks 1,2 (the loop body) are adaln
+    assert flags == [False, True, True, False]
+    # prefix/suffix blocks have no adaln submodules
+    assert not hasattr(m.transformer.h[0], "adaln_attn")
+    assert not hasattr(m.transformer.h[3], "adaln_attn")
+
+
+def test_adaln_near_zero_modulation_at_init():
+    """AdaLN-Zero: gamma/beta/alpha heads are zero at init, so modulation is identity and the
+    alpha gate is closed (modulation MLP outputs start near zero and grow during training)."""
+    from nanochat.gpt import norm
+    m, cfg = build(use_iter_adaln=True, loop_iters=3, **LOOP_KW)
+    blk = m.transformer.h[1]
+    h = torch.randn(2, 8, cfg.n_embd)
+    pe = m.iter_pe[1]
+    out, alpha = blk.adaln_attn(h, pe)
+    assert alpha.abs().max().item() == 0.0, "alpha gate must start closed (zero)"
+    assert torch.allclose(out, norm(h), atol=1e-6), "modulation must start as plain RMSNorm"
+    # MoE-branch adaln (no gate) also starts as identity
+    assert torch.allclose(m.transformer.h[1].adaln_moe(h, pe), norm(h), atol=1e-6)
+
+
+def test_adaln_loop_body_near_identity_at_init():
+    """With zero alpha gate and (adaln) zero heads, a loop-body block starts near-identity."""
+    m, cfg = build(use_iter_adaln=True, loop_iters=3, **LOOP_KW)
+    m.eval()
+    x = torch.randn(2, 8, cfg.n_embd)
+    cos_sin = (m.cos[:, :8], m.sin[:, :8])
+    with torch.no_grad():
+        y, _ = m.transformer.h[1](x, None, cos_sin, (-1, 0), None, 1, m.iter_pe[2])
+    assert (y - x).abs().max().item() < 1e-5
+
+
+def test_adaln_params_go_to_adamw_not_muon():
+    m, cfg = build(use_iter_adaln=True, **LOOP_KW)
+    opt = m.setup_optimizer()
+    def kind_of(p):
+        for g in opt.param_groups:
+            if any(pp is p for pp in g["params"]):
+                return g["kind"]
+    blk = m.transformer.h[1]
+    for p in (blk.adaln_attn.adaln_gamma.weight, blk.adaln_attn.adaln_token_proj.weight,
+              blk.adaln_attn.adaln_alpha.weight, blk.adaln_moe.adaln_beta.weight):
+        assert kind_of(p) == "adamw"
+
+
+def test_adaln_no_none_grads_and_all_params_defined():
+    m, cfg = build(use_iter_adaln=True, n_routed_experts=8, top_k=2, **LOOP_KW)
+    idx, tgt = a_batch(cfg)
+    m(idx, tgt).backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert missing == [], f"None grads: {missing}"
+
+
+def test_adaln_moe_branch_has_no_alpha_gate():
+    """Per the paper, only the attention branch gets a residual gate; the MoE branch does not."""
+    m, cfg = build(use_iter_adaln=True, **LOOP_KW)
+    assert m.transformer.h[1].adaln_attn.adaln_alpha is not None   # attn: gated
+    assert m.transformer.h[1].adaln_moe.adaln_alpha is None        # moe: no gate
+
+
+def test_adaln_grad_checkpoint_matches():
+    def run(flag):
+        torch.manual_seed(2)
+        m, cfg = build(use_iter_adaln=True, grad_checkpoint_loop=flag, **LOOP_KW)
+        m.train()
+        idx, tgt = a_batch(cfg)
+        loss = m(idx, tgt)
+        loss.backward()
+        g = m.transformer.h[1].adaln_attn.adaln_token_proj.weight.grad.clone()
+        return loss.item(), g
+    l0, g0 = run(False)
+    l1, g1 = run(True)
+    assert abs(l0 - l1) < 1e-5
+    assert torch.allclose(g0, g1, atol=1e-5)
+
+
+def test_adaln_modulation_grows_during_training():
+    """The AdaLN-Zero heads start at zero and should move away from zero as training proceeds."""
+    torch.manual_seed(0)
+    m, cfg = build(use_iter_adaln=True, n_routed_experts=8, top_k=2, **LOOP_KW)
+    m.train()
+    gamma0 = m.transformer.h[1].adaln_attn.adaln_gamma.weight.abs().sum().item()
+    assert gamma0 == 0.0
+    idx, tgt = a_batch(cfg)
+    opt = torch.optim.Adam(m.parameters(), lr=3e-3)
+    for _ in range(20):
+        opt.zero_grad(set_to_none=True)
+        m(idx, tgt).backward()
+        opt.step()
+    gamma1 = m.transformer.h[1].adaln_attn.adaln_gamma.weight.abs().sum().item()
+    assert gamma1 > 0.0, "modulation heads should differentiate from zero during training"
+
+
+def test_optimizer_partition_with_adaln():
+    m, cfg = build(use_iter_adaln=True, n_routed_experts=8, top_k=2, **LOOP_KW)
+    opt = m.setup_optimizer()  # runs the partition assertion internally
+    grouped = [id(p) for g in opt.param_groups for p in g["params"]]
+    assert set(grouped) == {id(p) for p in m.parameters()}
+    assert len(grouped) == len(set(grouped))

@@ -10,9 +10,16 @@ Further contributions from @karpathy and @chrisjmccormick.
 """
 
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
+
+# The fused AdamW/Muon kernels below are torch.compiled and specialize per parameter shape.
+# LoopMoE adds several new AdamW-group shapes (router, IterAdaLN heads), which can exceed the
+# default dynamo recompile cache (8) and abort with FailOnRecompileLimitHit. Raise the limit so
+# each distinct shape compiles once and is cached (compile happens once, then it's fast).
+torch._dynamo.config.cache_size_limit = max(getattr(torch._dynamo.config, "cache_size_limit", 8), 128)
 
 # -----------------------------------------------------------------------------
 """
