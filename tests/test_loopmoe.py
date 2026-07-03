@@ -15,18 +15,24 @@ import torch
 import pytest
 
 from nanochat.gpt import GPT, GPTConfig, MoE, MLP
+from nanochat.engine import KVCache
 
 
 def build(**kw):
     """Small CPU model. Defaults keep it tiny and fast."""
+    kw.setdefault("n_layer", 4)
     cfg = GPTConfig(
-        sequence_len=64, vocab_size=128, n_layer=4, n_head=4, n_kv_head=2,
+        sequence_len=64, vocab_size=128, n_head=4, n_kv_head=2,
         n_embd=128, window_pattern="L", **kw
     )
     m = GPT(cfg)          # not meta: build directly on CPU for tests
     m.to_empty(device="cpu")
     m.init_weights()
     return m, cfg
+
+
+# looped defaults: Lp=1, Lb=2, Ls=1 => n_layer=4 unique blocks
+LOOP_KW = dict(n_layer=4, n_prefix_layers=1, n_loop_layers=2, n_suffix_layers=1)
 
 
 def a_batch(cfg, B=2, T=32):
@@ -109,7 +115,8 @@ def test_bias_free_updates_bias_toward_balance():
     moe = m.transformer.h[0].mlp
     assert torch.count_nonzero(moe.expert_bias) == 0  # starts at zero
     idx, tgt = a_batch(cfg, B=4, T=32)
-    m(idx, tgt)  # one forward updates the bias
+    m(idx, tgt)                 # forward stashes the load counts
+    m.update_router_bias()      # deferred nudge (called once per optimizer step)
     assert torch.count_nonzero(moe.expert_bias) > 0, "expert_bias should move after a step"
     # magnitude of each nudge is exactly the update rate
     assert torch.allclose(moe.expert_bias.abs().unique(), torch.tensor([0.01]), atol=1e-6) or \
@@ -195,6 +202,131 @@ def test_no_expert_collapse_over_steps():
         opt.zero_grad(set_to_none=True)
         m(idx, tgt).backward()
         opt.step()
+        m.update_router_bias()  # aux-loss-free balancing nudge, once per step
     load = m.transformer.h[0].mlp.last_load
     # uniform share is 1/8 = 0.125; require no expert above ~3x uniform
     assert load.max() < 0.375, f"an expert captured a runaway share: {load.tolist()}"
+
+
+# ======================================================================================
+# Change 2 — sandwich loop layout
+# ======================================================================================
+def test_loop_schedule_and_effective_depth():
+    m, cfg = build(loop_iters=3, **LOOP_KW)
+    # prefix once + body(2) x K(3) + suffix once = 1 + 6 + 1 = 8 executions
+    assert m.n_exec == 8
+    assert m.exec_schedule[0] == (0, 0)          # prefix
+    assert m.exec_schedule[-1] == (3, 0)         # suffix
+    # loop body blocks are 1 and 2, appearing with iteration indices 0,1,2
+    body = [(b, k) for (b, k) in m.exec_schedule if b in (1, 2)]
+    assert body == [(1, 0), (2, 0), (1, 1), (2, 1), (1, 2), (2, 2)]
+
+
+def test_loop_forward_backward_all_grads_defined():
+    m, cfg = build(loop_iters=3, n_routed_experts=8, top_k=2, **LOOP_KW)
+    idx, tgt = a_batch(cfg)
+    m(idx, tgt).backward()
+    missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
+    assert missing == []
+
+
+def test_K_independent_unique_params_but_more_flops():
+    m3, cfg = build(loop_iters=3, **LOOP_KW)
+    m6, _ = build(loop_iters=6, **LOOP_KW)
+    r3, r6 = m3.param_report(), m6.param_report()
+    assert r3["total_params"] == r6["total_params"], "K must not change unique param count"
+    assert r6["effective_depth"] > r3["effective_depth"]
+    assert m6.estimate_flops() > m3.estimate_flops(), "more K => more compute"
+
+
+def test_K1_loop_reduces_to_standard_stack():
+    """A looped config with K=1 in the same block order must be bitwise-identical to a plain
+    stack with the same weights (useful for debugging)."""
+    torch.manual_seed(1)
+    ml, cfg = build(loop_iters=1, **LOOP_KW)
+    md, _ = build()  # plain 4-layer stack, same architecture
+    md.load_state_dict(ml.state_dict())
+    ml.eval()
+    md.eval()
+    idx, _ = a_batch(cfg)
+    with torch.no_grad():
+        assert torch.allclose(ml(idx), md(idx), atol=1e-5)
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_grad_checkpoint_matches_non_checkpoint(moe):
+    """Checkpointed and non-checkpointed loop bodies must produce matching loss and grads."""
+    extra = dict(n_routed_experts=8, top_k=2, load_balance_mode="aux_loss") if moe else {}
+    def run(flag):
+        torch.manual_seed(2)
+        m, cfg = build(loop_iters=3, grad_checkpoint_loop=flag, **LOOP_KW, **extra)
+        m.train()
+        idx, tgt = a_batch(cfg)
+        loss = m(idx, tgt)
+        loss.backward()
+        g = m.transformer.h[1].attn.c_q.weight.grad.clone()  # loop-body grad
+        return loss.item(), g
+    l0, g0 = run(False)
+    l1, g1 = run(True)
+    assert abs(l0 - l1) < 1e-5, f"loss mismatch: {l0} vs {l1}"
+    assert torch.allclose(g0, g1, atol=1e-5), f"grad mismatch max {(g0-g1).abs().max().item()}"
+
+
+def test_checkpoint_bias_free_updates_bias_once():
+    """Checkpointing recomputes the loop-body forward; the bias-free nudge must still apply
+    exactly once per step (guarded by torch.is_grad_enabled)."""
+    def bias_after_one_step(flag):
+        torch.manual_seed(4)
+        m, cfg = build(loop_iters=2, grad_checkpoint_loop=flag,
+                       n_routed_experts=8, top_k=2, load_balance_mode="bias_free",
+                       router_bias_update_rate=0.01, **LOOP_KW)
+        m.train()
+        idx, tgt = a_batch(cfg)
+        m(idx, tgt).backward()
+        m.update_router_bias()  # deferred nudge, after backward
+        # a loop-body MoE (block index 1)
+        return m.transformer.h[1].mlp.expert_bias.abs().max().item()
+    assert abs(bias_after_one_step(False) - bias_after_one_step(True)) < 1e-9
+
+
+def test_loop_kv_cache_matches_full_forward():
+    """Incremental (KV-cache) inference on a looped model must match a full forward, which
+    checks that each loop execution uses its own cache slot (kv_layer_idx == exec position)."""
+    torch.manual_seed(3)
+    m, cfg = build(loop_iters=3, **LOOP_KW)
+    m.eval()
+    seq = torch.randint(0, cfg.vocab_size, (1, 20))
+    with torch.no_grad():
+        full = m(seq)[:, -1, :]
+        kv = KVCache(batch_size=1, num_heads=cfg.n_kv_head, seq_len=20,
+                     head_dim=cfg.n_embd // cfg.n_head, num_layers=m.n_exec,
+                     device="cpu", dtype=torch.float32)
+        cached = m(seq, kv_cache=kv)[:, -1, :]
+    assert torch.allclose(full, cached, atol=1e-4), f"max diff {(full-cached).abs().max().item()}"
+
+
+def test_loop_config_requires_consistent_n_layer():
+    with pytest.raises(AssertionError):
+        # n_layer=4 but prefix+loop+suffix = 1+2+2 = 5 -> must fail
+        cfg = GPTConfig(sequence_len=64, vocab_size=128, n_layer=4, n_head=4, n_kv_head=2,
+                        n_embd=128, window_pattern="L",
+                        n_prefix_layers=1, n_loop_layers=2, n_suffix_layers=2, loop_iters=2)
+        GPT(cfg)
+
+
+def test_looped_moe_overfits_fixed_batch():
+    """End-to-end Milestone 2 check: a looped MoE learns (loss decreases) on a fixed batch."""
+    torch.manual_seed(0)
+    m, cfg = build(loop_iters=3, n_routed_experts=8, n_shared_experts=1, top_k=2, **LOOP_KW)
+    m.train()
+    idx, tgt = a_batch(cfg, B=2, T=32)
+    opt = torch.optim.Adam(m.parameters(), lr=3e-3)
+    first = None
+    for step in range(60):
+        opt.zero_grad(set_to_none=True)
+        loss = m(idx, tgt)
+        loss.backward()
+        opt.step()
+        if step == 0:
+            first = loss.item()
+    assert loss.item() < first * 0.6, f"looped MoE did not learn: {first:.3f} -> {loss.item():.3f}"

@@ -86,6 +86,60 @@ is required; the dense path is byte-for-byte the original nanochat.
 
 ---
 
+---
+
+## Change 2 — sandwich loop layout
+
+The stack is reorganized into three regions (all sizes are config fields):
+
+```
+h = prefix_blocks(x)            # Lp non-shared blocks, run once
+h_0 = h                         # loop starts from the prefix output; NO prefix re-injection
+for k in 1..K:                  # loop_iters = K
+    h = loop_body_blocks(h)     # Lb SHARED blocks, same weights every iteration
+h = suffix_blocks(h)            # Ls non-shared blocks, run once
+```
+
+- **Effective depth** = `Lp + K·Lb + Ls`; **unique layers** = `Lp + Lb + Ls == n_layer`.
+- The model builds `n_layer` unique `Block`s and **reuses** the loop-body modules `K` times, so
+  the unique parameter count is **independent of K** (verified by a test). More `K` buys more
+  depth/compute at zero extra parameters.
+- **BPTT:** running tied weights `K` times is backprop-through-time over shared parameters;
+  autograd accumulates the gradients across iterations — the loop is never detached.
+- **No prefix re-injection:** the loop iterates `h ← f(h)`, it does not add `h_0` back each step.
+  (nanochat's existing `x0_lambdas` feature blends the *token embedding*, not the prefix output,
+  so it does not constitute prefix re-injection.)
+- **`K=1` reduces exactly to a standard stack** — a looped config with `K=1` is bitwise-identical
+  to a plain stack of the same blocks (a test asserts this), which is handy for debugging.
+
+**Implementation details**
+
+- A single **execution schedule** `[(unique_block_idx, iter_k), ...]` drives both `forward` and
+  the FLOPs/param accounting. Per-block machinery (window sizes, resid/x0 scalars, value
+  embeddings) is indexed by the **unique** block index; the **KV-cache slot** and the backout
+  midpoint use the **execution position**, so each loop execution gets its own cache slot. The
+  inference `Engine` sizes the KV cache by effective depth (`model.n_exec`).
+- **Gradient checkpointing** (`grad_checkpoint_loop=True`): loop-body executions are wrapped in
+  non-reentrant `torch.utils.checkpoint`, recomputing their forward in backward to bound the
+  activation memory that otherwise scales with `K` (needed for the large config). Checkpointed
+  and non-checkpointed runs produce matching loss **and** gradients (tested).
+- **MoE + checkpointing interaction (subtle):** the aux-loss-free per-expert bias is **not**
+  mutated inside `forward`. Because a shared loop block is checkpointed multiple times per step
+  and recompute runs in reverse order, mutating the bias in `forward` would make an earlier
+  execution's recompute diverge from its saved activations. Instead each `MoE` stashes its
+  (all-reduced) token counts, and `GPT.update_router_bias()` applies the nudge once per optimizer
+  step, after `backward()` — this is also how DeepSeek-V3 does it. The training loop
+  (`scripts/base_train.py`) calls it right after `optimizer.step()`.
+
+**Turning the loop on/off:** set `n_loop_layers` to `0` (no loop, standard stack) or `>0`. When
+looping you must set `n_layer = n_prefix_layers + n_loop_layers + n_suffix_layers`; the model
+asserts this. `loop_iters` (K) controls the number of loop-body applications.
+
+**Startup logging** (`base_train.py`) prints total params, physical-active params (loop body
+counted once), FLOPs-active params (loop body counted `K×`), and effective vs unique depth.
+
+---
+
 ## Tests
 
 `tests/test_loopmoe.py` (CPU, fp32 — no GPU needed):
@@ -97,6 +151,13 @@ is required; the dense path is byte-for-byte the original nanochat.
 - bias-free balancing moves the bias and produces no aux/grad on the bias;
 - optimizer partition (router→AdamW, experts→Muon);
 - `param_report` active < total for MoE;
-- MoE **overfits a fixed batch** (loss decreases) and **shows no expert collapse** over 200 steps.
+- MoE **overfits a fixed batch** (loss decreases) and **shows no expert collapse** over 200 steps;
+- loop schedule & effective depth; all loop params get grads;
+- **K-independence** of unique params (more `K` ⇒ more FLOPs, same params);
+- **K=1 loop == standard stack** (bitwise);
+- **checkpointed == non-checkpointed** loss and grads (dense + MoE loop bodies);
+- bias nudge applies exactly once under checkpointing;
+- **looped KV-cache inference == full forward**;
+- looped-MoE overfits a fixed batch.
 
 Run: `NANOCHAT_DTYPE=float32 python -m pytest tests/test_loopmoe.py -v`

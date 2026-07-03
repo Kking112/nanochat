@@ -52,6 +52,20 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# LoopMoE architecture (all default to stock dense nanochat)
+parser.add_argument("--n-routed-experts", type=int, default=0, help="MoE routed experts (0 = dense MLP)")
+parser.add_argument("--n-shared-experts", type=int, default=0, help="MoE always-on shared experts")
+parser.add_argument("--top-k", type=int, default=1, help="MoE experts selected per token")
+parser.add_argument("--expert-hidden-dim", type=int, default=0, help="MoE per-expert hidden dim (0 = auto)")
+parser.add_argument("--load-balance-mode", type=str, default="bias_free", choices=["bias_free", "aux_loss"], help="MoE load balancing strategy")
+parser.add_argument("--aux-loss-coef", type=float, default=0.01, help="coefficient for the MoE aux load-balancing loss")
+parser.add_argument("--router-bias-update-rate", type=float, default=0.001, help="bias nudge rate for bias_free balancing")
+parser.add_argument("--n-prefix-layers", type=int, default=0, help="sandwich loop: non-shared prefix blocks (Lp)")
+parser.add_argument("--n-loop-layers", type=int, default=0, help="sandwich loop: shared loop-body blocks (Lb, 0 = no loop)")
+parser.add_argument("--n-suffix-layers", type=int, default=0, help="sandwich loop: non-shared suffix blocks (Ls)")
+parser.add_argument("--loop-iters", type=int, default=1, help="sandwich loop: loop-body iterations (K)")
+parser.add_argument("--use-iter-adaln", action="store_true", help="enable IterAdaLN modulation in the loop body")
+parser.add_argument("--grad-checkpoint-loop", action="store_true", help="gradient-checkpoint the loop body (large config)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +151,14 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        # LoopMoE fields
+        n_routed_experts=args.n_routed_experts, n_shared_experts=args.n_shared_experts,
+        top_k=args.top_k, expert_hidden_dim=args.expert_hidden_dim,
+        load_balance_mode=args.load_balance_mode, aux_loss_coef=args.aux_loss_coef,
+        router_bias_update_rate=args.router_bias_update_rate,
+        n_prefix_layers=args.n_prefix_layers, n_loop_layers=args.n_loop_layers,
+        n_suffix_layers=args.n_suffix_layers, loop_iters=args.loop_iters,
+        use_iter_adaln=args.use_iter_adaln, grad_checkpoint_loop=args.grad_checkpoint_loop,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -256,6 +278,20 @@ for key, value in param_counts.items():
 num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+# LoopMoE param breakdown: distinguishes total vs active params (the point of MoE + looping).
+# active_params_flops counts each loop-body execution (K x) and only the active experts.
+report = model.param_report()
+print0("LoopMoE param breakdown:")
+print0(f"  total params           : {report['total_params']:,}")
+print0(f"  active params (physical): {report['active_params_physical']:,}  (shared loop block counted once)")
+print0(f"  active params (FLOPs)   : {report['active_params_flops']:,}  (loop body counted K x)")
+print0(f"  effective depth         : {report['effective_depth']} (unique layers: {report['unique_layers']})")
+if model.config.use_moe:
+    from nanochat.gpt import moe_expert_hidden_dim
+    print0(f"  MoE: {model.config.n_routed_experts} routed + {model.config.n_shared_experts} shared experts, "
+           f"top_k={model.config.top_k}, expert_hidden={moe_expert_hidden_dim(model.config)}, "
+           f"balance={model.config.load_balance_mode}")
 
 # 1) Use scaling laws to determine the optimal training horizon in tokens
 # The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
@@ -537,6 +573,10 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    # MoE auxiliary-loss-free load balancing: nudge per-expert router bias once per step (no-op
+    # for the dense model or when using the aux-loss balancing mode). Uses the raw (uncompiled)
+    # model so it sees the real module tree.
+    orig_model.update_router_bias()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()

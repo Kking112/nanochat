@@ -193,7 +193,11 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        # num_layers is the number of block EXECUTIONS (effective depth), not unique layers:
+        # a looped model runs its shared body K times and each execution needs its own cache slot.
+        # Falls back to n_layer for models that predate the loop (e.g. simple test doubles).
+        n_exec = getattr(self.model, "n_exec", m.n_layer)
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": n_exec}
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),

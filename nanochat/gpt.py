@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch.utils.checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -110,8 +111,12 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, kv_layer_idx=None):
         B, T, C = x.size()
+        # kv_layer_idx is the cache slot for THIS execution. For the standard stack it equals
+        # self.layer_idx, but a shared loop-body block runs at several schedule positions, so
+        # the caller passes the execution index explicitly. Defaults to self.layer_idx.
+        li = self.layer_idx if kv_layer_idx is None else kv_layer_idx
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -139,7 +144,7 @@ class CausalSelfAttention(nn.Module):
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            k_cache, v_cache = kv_cache.get_layer_cache(li)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
@@ -147,8 +152,8 @@ class CausalSelfAttention(nn.Module):
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
+            # Advance position after the last cache slot (last execution) processes
+            if li == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
@@ -231,12 +236,16 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([Expert(config.n_embd, hidden) for _ in range(config.n_routed_experts)])
         self.shared_experts = nn.ModuleList([Expert(config.n_embd, hidden) for _ in range(config.n_shared_experts)])
         # Per-expert selection bias for the auxiliary-loss-free balancing strategy.
-        # Not a leaf we optimize with SGD: it is nudged manually (see _update_bias). Persistent
-        # so it survives checkpoint save/resume.
+        # Not a leaf we optimize with SGD: it is nudged by step_bias() AFTER each optimizer step
+        # (deferred out of forward so it is safe under gradient checkpointing, which recomputes
+        # the loop-body forward). Persistent so it survives checkpoint save/resume.
         self.register_buffer("expert_bias", torch.zeros(config.n_routed_experts), persistent=True)
         # Instrumentation (detached, for logging only; filled each training forward).
         self.register_buffer("last_load", torch.zeros(config.n_routed_experts), persistent=False)
         self.last_entropy = 0.0
+        # Latest global token counts stashed by forward, consumed by step_bias(). Plain attribute
+        # (not a buffer/param) so it never enters state_dict, meta init, or the autograd graph.
+        self.last_global_counts = None
 
     @torch.compiler.disable
     def forward(self, x):
@@ -281,35 +290,46 @@ class MoE(nn.Module):
             y = y + expert(x_flat)
 
         # --- Load balancing bookkeeping ---------------------------------------------------
+        # aux must ALWAYS be computed when training (independent of grad state) so the module's
+        # output structure is stable under gradient checkpointing, which runs forward twice.
         aux = None
-        if self.training:
-            # Sync token counts across ranks so bias/aux see the global load (nanochat runs
-            # data-parallel without a DDP wrapper; grads are reduced in the optimizer).
+        if self.training and self.load_balance_mode == "aux_loss":
+            # Classic Switch-Transformer aux loss: E * sum_i f_i * P_i, encourages the fraction
+            # of tokens f_i and mean routing prob P_i to both be ~1/E (balanced).
+            f_i = counts / counts.sum().clamp_min(1)     # (E,) local token fractions
+            P_i = probs.mean(dim=0)                       # (E,)
+            aux = self.n_routed_experts * (f_i * P_i).sum()
+
+        # Stat/bookkeeping side effects must happen exactly ONCE per optimizer step. Under
+        # gradient checkpointing the first forward runs with grad disabled and is recomputed
+        # with grad enabled in backward; gating on torch.is_grad_enabled() makes these run once
+        # (in the recompute), avoiding an extra all-reduce on the discarded first pass. Without
+        # checkpointing, training forwards have grad enabled, so this runs normally. Crucially we
+        # only READ here and stash counts -- expert_bias is NOT mutated in forward (see step_bias),
+        # because the same shared loop block is checkpointed multiple times per step and mutating
+        # it here would make an earlier execution's recompute diverge from its saved activations.
+        if self.training and torch.is_grad_enabled():
             global_counts = counts
             if dist.is_available() and dist.is_initialized():
                 global_counts = counts.clone()
                 dist.all_reduce(global_counts, op=dist.ReduceOp.SUM)
+            self.last_global_counts = global_counts.detach()
             self.last_load = (global_counts / global_counts.sum().clamp_min(1)).detach()
-            # routing entropy (higher = more spread out); cheap collapse detector
-            mean_p = probs.mean(dim=0)
+            mean_p = probs.mean(dim=0)  # routing entropy: cheap router-collapse detector
             self.last_entropy = float(-(mean_p * (mean_p + 1e-9).log()).sum().detach())
-
-            if self.load_balance_mode == "bias_free":
-                self._update_bias(global_counts)
-            else:
-                # Classic Switch-Transformer aux loss: E * sum_i f_i * P_i, encourages the
-                # fraction of tokens f_i and mean routing prob P_i to both be ~1/E (balanced).
-                f_i = global_counts / global_counts.sum().clamp_min(1)     # (E,)
-                P_i = probs.mean(dim=0)                                     # (E,)
-                aux = self.n_routed_experts * (f_i * P_i).sum()
 
         return y.view(B, T, C), aux
 
     @torch.no_grad()
-    def _update_bias(self, global_counts):
+    def step_bias(self):
         """DeepSeek-V3 aux-loss-free update: nudge each expert's selection bias by the sign of
-        its load error (underloaded experts get a positive nudge, overloaded a negative one)."""
-        load = global_counts / global_counts.sum().clamp_min(1)
+        its load error (underloaded experts get a positive nudge, overloaded a negative one).
+        Called once per optimizer step (after backward), not inside forward -- see the note in
+        forward(). No-op unless bias_free balancing is active and a forward has run."""
+        if self.load_balance_mode != "bias_free" or self.last_global_counts is None:
+            return
+        counts = self.last_global_counts
+        load = counts / counts.sum().clamp_min(1)
         target = 1.0 / self.n_routed_experts
         err = target - load                       # >0 => underloaded => raise its bias
         self.expert_bias += self.bias_update_rate * torch.sign(err)
@@ -322,8 +342,10 @@ class Block(nn.Module):
         # Feed-forward is either the dense ReLU^2 MLP or the MoE layer. Both return (out, aux).
         self.mlp = MoE(config) if config.use_moe else MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, kv_layer_idx=None, iter_k=0):
+        # iter_k is the loop iteration index (0 for non-loop / prefix / suffix); it is unused
+        # by the standard block and consumed by IterAdaLN inside the loop body (Change 3).
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, kv_layer_idx)
         ff_out, aux = self.mlp(norm(x))
         x = x + ff_out
         return x, aux
@@ -545,6 +567,22 @@ class GPT(nn.Module):
         Lp, Lb = self.config.n_prefix_layers, self.config.n_loop_layers
         return (Lp, Lp + Lb)
 
+    def update_router_bias(self):
+        """Apply the aux-loss-free per-expert bias nudge for every MoE layer. Call once per
+        optimizer step, after backward(). No-op when MoE / bias_free balancing is not in use."""
+        for m in self.modules():
+            if isinstance(m, MoE):
+                m.step_bias()
+
+    def moe_load_stats(self):
+        """Return per-MoE routing instrumentation for logging: list of dicts with the max
+        per-expert load fraction and the routing entropy. Empty when MoE is not in use."""
+        stats = []
+        for m in self.modules():
+            if isinstance(m, MoE):
+                stats.append({"max_load": float(m.last_load.max()), "entropy": m.last_entropy})
+        return stats
+
     def get_device(self):
         return self.transformer.wte.weight.device
 
@@ -765,19 +803,37 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        # Forward the trunk of the Transformer, walking the execution schedule.
+        # For the stock model this is just each block once; for the sandwich loop it is
+        # prefix once + loop-body K times (shared weights, no prefix re-injection) + suffix once.
+        # Per-block machinery is indexed by the UNIQUE block index `bi`; the KV-cache slot and
+        # the backout midpoint use the EXECUTION position `pos` (effective depth), so a shared
+        # loop block gets a distinct cache slot on each iteration.
+        x0 = x  # save initial normalized embedding for x0 residual (nanochat feature; note this
+                # blends the token embedding, NOT the prefix output, so it is not "re-injection")
+        backout_pos = self.n_exec // 2  # cache at the effective-depth halfway point
         x_backout = None
         aux_loss_total = None  # accumulated MoE auxiliary load-balancing loss (aux_loss mode)
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x, aux = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+        loop_range = self.loop_body_range()  # (start, end) unique idx of shared body, or None
+        # Gradient-checkpoint the loop body only (its activations scale with K). Training only,
+        # and only when there is no KV cache (i.e. not incremental inference).
+        do_ckpt = self.config.grad_checkpoint_loop and self.training and kv_cache is None
+        for pos, (bi, iter_k) in enumerate(self.exec_schedule):
+            x = self.resid_lambdas[bi] * x + self.x0_lambdas[bi] * x0
+            ve = self.value_embeds[str(bi)](idx).to(x.dtype) if str(bi) in self.value_embeds else None
+            block = self.transformer.h[bi]
+            window = self.window_sizes[bi]
+            is_loop_body = loop_range is not None and loop_range[0] <= bi < loop_range[1]
+            if do_ckpt and is_loop_body:
+                # non-reentrant checkpoint: recomputes this block's forward in backward to save
+                # activation memory; autograd still accumulates the shared-weight grads over K.
+                x, aux = torch.utils.checkpoint.checkpoint(
+                    block, x, ve, cos_sin, window, kv_cache, pos, iter_k, use_reentrant=False)
+            else:
+                x, aux = block(x, ve, cos_sin, window, kv_cache, pos, iter_k)
             if aux is not None:
                 aux_loss_total = aux if aux_loss_total is None else aux_loss_total + aux
-            if i == backout_layer:
+            if pos == backout_pos:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
