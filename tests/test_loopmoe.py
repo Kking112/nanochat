@@ -480,3 +480,22 @@ def test_adamw_optimizer_lower_lr_for_adaln():
             if any(p is param for p in g["params"]):
                 return g["lr"]
     assert lr_of(adaln_w) < lr_of(attn_w), "IterAdaLN group must use a lower LR than matrices"
+
+
+# ======================================================================================
+# Non-finite gradient guard (the mechanism base_train uses to skip poisoned steps)
+# ======================================================================================
+def test_grad_norm_detects_finite_and_nonfinite():
+    """base_train skips the optimizer step when the global grad norm is non-finite. Verify the
+    detection works on a real looped-MoE model's gradients (finite after a normal backward,
+    non-finite once a nan is injected)."""
+    m, cfg = build(use_iter_adaln=True, n_routed_experts=8, top_k=2, **LOOP_KW)
+    idx, tgt = a_batch(cfg)
+    m(idx, tgt).backward()
+    grads = [p.grad for p in m.parameters() if p.grad is not None]
+    norm = torch.nn.utils.get_total_norm(grads)
+    assert bool(torch.isfinite(norm)), "healthy backward should give a finite grad norm"
+    # inject a nan into one gradient -> the global norm must become non-finite (step gets skipped)
+    grads[0].view(-1)[0] = float("nan")
+    bad = torch.nn.utils.get_total_norm([p.grad for p in m.parameters() if p.grad is not None])
+    assert not bool(torch.isfinite(bad)), "a nan gradient must make the global norm non-finite"

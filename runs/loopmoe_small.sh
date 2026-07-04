@@ -66,7 +66,15 @@ python -m scripts.base_train \
     --num-iterations=4000 \
     --eval-every=250 \
     --sample-every=1000 \
+    --save-every=500 \
     --run=$WANDB_RUN
+
+# Notes:
+# - A non-finite gradient (transient MoE/IterAdaLN loss spike) now SKIPS that optimizer step
+#   instead of NaN-poisoning the whole model permanently; watch for "skipping optimizer step".
+# - --save-every=500 writes resumable checkpoints. If a run dies, resume from the last good step:
+#     python -m scripts.base_train ...same args... --resume-from-step=3500
+# - If you see frequent skips, add e.g. --grad-clip=1.0 and/or lower --matrix-lr.
 
 # Evaluate
 python -m scripts.base_eval --device-batch-size=8 || true

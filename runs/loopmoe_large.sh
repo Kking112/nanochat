@@ -75,4 +75,8 @@ torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- \
     --num-iterations=2000 \
     --eval-every=250 \
     --sample-every=1000 \
+    --save-every=250 \
     --run=$WANDB_RUN
+
+# A non-finite gradient (transient MoE/IterAdaLN spike) skips that step rather than NaN-poisoning
+# the model; --save-every=250 gives resumable checkpoints (--resume-from-step=N to continue).

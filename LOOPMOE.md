@@ -284,6 +284,14 @@ one group). The `MoE.expert_bias` is a **buffer, not a parameter**, so it is nev
   loss and gradients.
 - **Shared-weight gradients:** the loop is never detached; autograd accumulates the tied-weight
   gradients across the `K` iterations (BPTT).
+- **Loss spikes → permanent NaN:** MoE/IterAdaLN runs are prone to transient loss spikes. On the
+  bf16 path there is no GradScaler to skip a bad step, so `base_train.py` guards manually: it
+  computes the global gradient norm each step and **skips the optimizer step (and the bias nudge)
+  when the norm is non-finite**, logging `skipping optimizer step`. Without this, one nan/inf
+  gradient poisons every parameter and the run never recovers. The loss EMA also ignores
+  non-finite values so a single spike doesn't latch the displayed loss to `nan`. Use
+  `--grad-clip` for an additional global-norm clip, and `--save-every` for resumable checkpoints
+  (`--resume-from-step=N`) so a run is never lost.
 - **Bias update under checkpointing:** the bias-free nudge is deferred to
   `GPT.update_router_bias()` (called once per optimizer step) rather than mutating state inside
   `forward`, because a shared loop block is recomputed multiple times per step.

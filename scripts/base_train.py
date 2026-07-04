@@ -79,6 +79,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--grad-clip", type=float, default=0.0, help="global grad-norm clip (0 = disabled). A non-finite gradient always skips the step regardless, to avoid permanently NaN-poisoning the model on a transient MoE/AdaLN spike.")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -462,6 +463,7 @@ def get_weight_decay(it):
 # Training loop
 
 # Loop state (variables updated by the training loop)
+num_skipped_steps = 0  # count of optimizer steps skipped due to non-finite gradients
 if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
@@ -600,6 +602,7 @@ while True:
         if group.get('kind') == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    step_skipped = False
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
@@ -608,14 +611,39 @@ while True:
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
     else:
-        optimizer.step()
+        # bf16/fp32 path: there is no GradScaler to skip bad steps, so we guard manually.
+        # Compute the global grad norm (also applies clipping if --grad-clip is set) and SKIP
+        # the optimizer step when it is non-finite. Muon's updates are otherwise bounded, but a
+        # single nan/inf gradient from an MoE/AdaLN loss spike would permanently NaN-poison every
+        # parameter (there is no recovery once weights are nan), which is exactly the failure this
+        # guards against. In distributed runs, all ranks must agree to skip (all-reduce the flag).
+        params = [p for p in orig_model.parameters() if p.grad is not None]
+        if args.grad_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+        else:
+            grad_norm = torch.nn.utils.get_total_norm([p.grad for p in params])
+        finite = bool(torch.isfinite(grad_norm))
+        if is_ddp_initialized():
+            flag = torch.tensor([0.0 if finite else 1.0], device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            finite = flag.item() == 0.0
+        if finite:
+            optimizer.step()
+        else:
+            step_skipped = True
+            num_skipped_steps += 1
+            print0(f"step {step:05d}: non-finite gradient (norm={grad_norm.item():.3e}) -> skipping optimizer step (total skipped: {num_skipped_steps})")
     # MoE auxiliary-loss-free load balancing: nudge per-expert router bias once per step (no-op
-    # for the dense model or when using the aux-loss balancing mode). Uses the raw (uncompiled)
-    # model so it sees the real module tree.
-    orig_model.update_router_bias()
+    # for the dense model or when using the aux-loss balancing mode). Skip when the step was
+    # skipped, since its stashed counts came from the same bad micro-batch. Uses the raw
+    # (uncompiled) model so it sees the real module tree.
+    if not step_skipped:
+        orig_model.update_router_bias()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -625,7 +653,10 @@ while True:
 
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
+    # Only fold finite losses into the EMA: a single nan/inf (e.g. from a skipped spike step)
+    # would otherwise latch the smoothed loss to nan forever and hide a recovery.
+    if math.isfinite(train_loss_f):
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
