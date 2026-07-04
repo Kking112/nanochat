@@ -295,9 +295,13 @@ one group). The `MoE.expert_bias` is a **buffer, not a parameter**, so it is nev
 - **Bias update under checkpointing:** the bias-free nudge is deferred to
   `GPT.update_router_bias()` (called once per optimizer step) rather than mutating state inside
   `forward`, because a shared loop block is recomputed multiple times per step.
-- **IterAdaLN divergence in bf16:** the unbounded modulation needs a **much lower LR** than the
-  matrices — it gets its own AdamW group at `0.1×` the matrix LR. At the full matrix LR it NaNs
-  within a few steps.
+- **IterAdaLN divergence in bf16 (important):** the modulation heads are **bounded with `tanh`**
+  (scale `1+gamma` in (0,2), shift `beta` in (-1,1), gate `alpha` in (-1,1)). Because the loop
+  body runs `K` times with shared weights, an *unbounded* scale/shift compounds across the
+  effective depth and reliably overflows bf16 to NaN at scale — empirically it NaNs within tens
+  of steps even at a tiny LR, whereas the bounded form is stable at every LR tested. `tanh(0)=0`
+  keeps the AdaLN-Zero identity init exact. IterAdaLN also gets its own AdamW group at `0.1×` the
+  matrix LR as a second margin.
 - **AdaLN dead branch:** an adaln loop-body block's attention `c_proj` is given a small non-zero
   init (not zero) so the zero-init alpha gate has a live gradient path.
 - **`torch.compile` recompiles:** the iteration PE is precomputed into a buffer (not built from a

@@ -392,11 +392,17 @@ class IterAdaLN(nn.Module):
         # condition = token stream (per token) + iteration stream (broadcast over tokens)
         c = self.adaln_token_proj(h) + self.adaln_iter_mlp(pe.to(h.dtype))      # (B,T,cond)
         c = F.silu(c)
-        gamma = self.adaln_gamma(c)
-        beta = self.adaln_beta(c)
+        # Bound the modulation with tanh. The loop body runs K times with SHARED weights, so an
+        # unbounded (1+gamma)/beta scale-shift compounds across the effective depth and reliably
+        # overflows bf16 to NaN at scale (empirically: unbounded NaNs within tens of steps even at
+        # tiny LR; bounded is stable). tanh keeps AdaLN-Zero init exact (tanh(0)=0 => identity,
+        # closed gate) and caps the per-layer amplification: scale (1+gamma) in (0,2), shift beta
+        # in (-1,1), gate alpha in (-1,1).
+        gamma = torch.tanh(self.adaln_gamma(c))
+        beta = torch.tanh(self.adaln_beta(c))
         out = (1 + gamma) * norm(h) + beta  # affine-free RMSNorm, dynamically modulated
         if self.gate:
-            alpha = self.adaln_alpha(c)
+            alpha = torch.tanh(self.adaln_alpha(c))
             return out, alpha
         return out
 
