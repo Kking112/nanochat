@@ -261,6 +261,10 @@ def get_peak_flops(device_name: str) -> float:
         (["mi300a"], 980.6e12),
         (["mi250x"], 383e12),
         (["mi250"], 362.1e12),
+        # NVIDIA Blackwell workstation (GB202)
+        # BF16 dense tensor, FP32 accumulate. Derived consistently with the
+        # consumer 5090 entry from NVIDIA's 4000 AI-TOPS (FP4 sparse) spec.
+        (["rtx pro 6000"], 250e12),
         # Consumer RTX
         (["5090"], 209.5e12),
         (["4090"], 165.2e12),

@@ -1,0 +1,160 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1782853175621,
+  "projectRoot": "/home/neo/Desktop/Projects/OpenSource/nanochat",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "fastapi",
+        "version": null,
+        "category": "backend"
+      },
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "scripts",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "dev": {
+      "path": "dev",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1782853175620,
+      "keyFiles": [
+        "LEADERBOARD.md",
+        "LOG.md",
+        "estimate_gpt3_core.ipynb",
+        "gen_synthetic_data.py",
+        "generate_logo.html"
+      ]
+    },
+    "nanochat": {
+      "path": "nanochat",
+      "purpose": null,
+      "fileCount": 17,
+      "lastAccessed": 1782853175620,
+      "keyFiles": [
+        "__init__.py",
+        "checkpoint_manager.py",
+        "common.py",
+        "core_eval.py",
+        "dataloader.py"
+      ]
+    },
+    "runs": {
+      "path": "runs",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1782853175620,
+      "keyFiles": [
+        "miniseries.sh",
+        "runcpu.sh",
+        "scaling_laws.sh",
+        "speedrun.sh"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 9,
+      "lastAccessed": 1782853175620,
+      "keyFiles": [
+        "base_eval.py",
+        "base_train.py",
+        "chat_cli.py",
+        "chat_eval.py",
+        "chat_rl.py"
+      ]
+    },
+    "tasks": {
+      "path": "tasks",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1782853175620,
+      "keyFiles": [
+        "arc.py",
+        "common.py",
+        "customjson.py",
+        "gsm8k.py",
+        "humaneval.py"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 2,
+      "lastAccessed": 1782853175620,
+      "keyFiles": [
+        "test_attention_fallback.py",
+        "test_engine.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "runs/speedrun_singlegpu.sh",
+      "accessCount": 3,
+      "lastAccessed": 1782854447832,
+      "type": "file"
+    },
+    {
+      "path": "nanochat/common.py",
+      "accessCount": 2,
+      "lastAccessed": 1782854346352,
+      "type": "file"
+    },
+    {
+      "path": "nanochat/flash_attention.py",
+      "accessCount": 1,
+      "lastAccessed": 1782854262594,
+      "type": "file"
+    },
+    {
+      "path": "scripts/base_train.py",
+      "accessCount": 1,
+      "lastAccessed": 1782854325164,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
