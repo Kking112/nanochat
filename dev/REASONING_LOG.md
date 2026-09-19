@@ -28,6 +28,14 @@
 
 ## Milestone ledger
 
+### Checkpoint refactor (after M0 `ed28e72`)
+
+Centralized the existing three source-directory mappings in
+`nanochat.checkpoint_manager.CHECKPOINT_SOURCES`, with no source behavior change.
+Verification: full required non-slow suite **48 passed, 10 skipped**, 5.17 s
+(`/tmp/reasoning-ckpt-tests.log`). New reasoning source entries are a separate
+behavior change. Protected implementation files are untouched.
+
 | Milestone | State | Evidence |
 |---|---|---|
 | M0 | complete | 48 passed, 10 skipped; fresh bounded five-task baseline above |

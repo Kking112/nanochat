@@ -15,6 +15,13 @@ from nanochat.common import setup_default_logging
 # Set up logging
 setup_default_logging()
 logger = logging.getLogger(__name__)
+
+CHECKPOINT_SOURCES: dict[str, str] = {
+    "base": "base_checkpoints",
+    "sft": "chatsft_checkpoints",
+    "rl": "chatrl_checkpoints",
+}
+
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
@@ -161,22 +168,14 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
+    model_dir = CHECKPOINT_SOURCES[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)
 
 def load_optimizer_state(source, device, rank, model_tag=None, step=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
+    model_dir = CHECKPOINT_SOURCES[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
     if model_tag is None:
