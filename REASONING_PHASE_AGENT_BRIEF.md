@@ -66,23 +66,47 @@ git checkout -b feature/reasoning-phase
 
 ## 5. Reward specification (`nanochat/rewards.py`)
 
-Pure functions, no torch, fully unit-tested. Each returns a dataclass with per-component values plus `total`, so the RL script can log components separately.
+The approved implementation plan replaces the original additive reward with
+strictly separated correctness bands. The implementation is pure Python with
+`RewardConfig` and `RewardBreakdown` dataclasses; arithmetic checks receive the
+existing runtime calculator as a callable.
 
 ```
-total = w_fmt * r_format + w_ans * r_answer + w_proc * r_process - penalties
-defaults: w_fmt = 0.1, w_ans = 0.6, w_proc = 0.3      (total clipped to [0, 1])
+correct = task.evaluate(conversation, response) == 1
+s = clip01(0.15*r_format + 0.45*r_answer_partial + 0.40*r_process - penalties)
+q = clip01(0.50*r_format + 0.50*r_process - penalties)
+total = 0.70 + 0.30*q if correct else 0.50*s
 ```
 
-- `r_format` in {0, 0.5, 1}: 0.5 for exactly one well-formed closed `<think>` block with non-empty content, 0.5 for a parsable answer marker after it.
-- `r_answer` in [0, 1]: task-defined. 1.0 for an exact match after normalization (strip `$`, commas, trailing `.0`, whitespace). Partial credit only where the task has a meaningful metric: fraction of parts correct for multi-part answers, per-element or per-cell accuracy for structured answers, closeness-to-target for Countdown-style tasks. No distance-based partial credit for single numeric word-problem answers.
-- `r_process` in [0, 1], "showing work":
-  - *Step coverage* (main term): fraction of the gold intermediate values (from GSM8K `<<expr=result>>`, or from a procedural generator's own solution trace) that appear as computed results in the model's think block (tool outputs or `= value` statements). Each gold value counts once.
-  - *Arithmetic validity* (penalty only): parse `a op b = c` statements in the think block and evaluate them with the existing safe calculator; subtract for false statements. Correct statements earn nothing by themselves, otherwise the model farms reward with `1+1=2`.
-  - *Consistency* (small): final answer equals the last computed value in the trace.
-- Penalties: truncated sample (no `<|assistant_end|>`): soft overlong penalty ramping over the last 128 tokens of the budget; repetition: fraction of repeated 4-grams above a threshold; text after the answer marker.
-- **Dominance invariant (enforce with a property test):** the best possible wrong-answer sample scores strictly below the worst possible correct, well-formatted sample. With the defaults: max wrong = 0.1 + 0.3 = 0.4 < 0.7.
-- `--process-weight-final` flag: linearly anneal `w_proc` toward this value over training (default: anneal 0.3 -> 0.1), moving the freed weight to `w_ans`.
-- `--reward-mode {binary,shaped}` so the same script produces the ablation baseline.
+Binary correctness alone chooses the band, including malformed correct responses.
+Only `s` and `q` are clipped. Binary mode returns `float(correct)`. Configurable
+band boundaries must remain separated; nonnegative in-band weights must sum to
+one. `--process-weight-final=0.1` linearly anneals each band's process weight,
+transferring weight to partial answer for incorrect responses and to format for
+correct responses. Diagnostics include correctness, band, `s`, `q`, raw terms,
+individual penalties, effective weights and total.
+
+- Format: half credit for one nonempty, unnested, closed think block; half for
+  one task-parsable answer marker after the block. Malformed tags and ambiguous
+  answer markers receive no corresponding credit.
+- Partial answer: exact normalized numeric matching for GSM8K/chains, sorting
+  per-position accuracy, and Countdown closeness only for legal expressions using
+  the supplied numbers. No numeric-distance reward for word problems.
+- Process: 90% verified reference-intermediate coverage and 10% final-result
+  consistency, normalized over applicable terms. Count each reference value once;
+  unrelated arithmetic earns no credit. Without reference intermediates, report
+  unavailable process verification and use neutral quality .5.
+- Penalties: .2 times the invalid checked-statement fraction; up to .1 for missing
+  normal termination during the final 128 effective-budget tokens; up to .1 for
+  repeated word four-grams above a .2 fraction; .1 for text after the answer line.
+- Invariant: every incorrect response scores at most .5 and every correct
+  response at least .7, regardless of formatting or penalties. Randomized tests
+  enforce this for partial-credit tasks as well.
+
+The detailed approved workflow and experiment gates are in
+`dev/REASONING_DESIGN.md`; those supersede the older milestone details below
+(in particular no web UI, d24 step486 input, and full experiments only after
+post-smoke budget approval).
 
 ## 6. Milestones
 

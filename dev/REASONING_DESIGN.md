@@ -33,6 +33,10 @@ result consistency .1, normalized over available terms. Repeated intermediate
 values count once. Correct unrelated equations give no coverage. Tasks lacking
 reference intermediates report availability and use neutral quality. Inject the
 existing calculator rather than importing Torch into the reward library.
+Missing-reference neutral quality is .5, so a correct, well-formatted sorting
+answer scores .925 at the initial shaped weights; it is not artificially given
+verified-work credit. Exact rational normalization is used for answers. Only
+calculator-statement verification permits minimal floating-point roundoff.
 Penalties: .2 times false checked-statement fraction; up to .1 for missing normal
 termination ramped over the final 128 budget tokens; up to .1 for repeated word
 four-grams above .2; .1 for text after the final answer line.

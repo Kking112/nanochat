@@ -39,9 +39,26 @@ behavior change. Protected implementation files are untouched.
 | Milestone | State | Evidence |
 |---|---|---|
 | M0 | complete | 48 passed, 10 skipped; fresh bounded five-task baseline above |
-| M1 | in progress | Pure parser/reward work |
+| M1 | complete | 73 focused tests; 124 passed, 10 skipped in integrated suite |
 | M2 | in progress | Dataset provenance inspection and fixture tests |
 | M3 | pending | SFT implementation and 50-step smoke |
 | M4 | in progress | Generation adapter, RL implementation and fixture tests |
 | M5 | pending | CLI, evaluator, runner and documentation |
 | M6 | budget approval pending | No experimental improvement claim |
+
+## M1 — format and reward verification
+
+Parent checkpoint refactor: `689ba9e`. Added Torch-independent parsing, exact
+numeric normalization, tool-aware arithmetic verification, repetition counting,
+validated reward configuration, separated correctness bands, process annealing,
+and full component diagnostics. Updated brief section 5 to replace its old
+additive formula; the approved design specifies neutral unavailable-process
+quality rather than fabricating intermediate verification.
+
+Commands: `uv run --no-sync python -m pytest tests/test_reasoning.py
+tests/test_rewards.py -q` (**73 passed**); required full command
+`uv run --no-sync python -m pytest -m "not slow"` (**124 passed, 10 skipped**,
+6.10 s; `/tmp/reasoning-m1-tests.log`). Randomized tests cover both correctness
+bands even with malformed responses and misleading partial-answer scores;
+fixtures cover equation spam, duplicates, false arithmetic, stop-budget ramps,
+trailing text and annealing endpoints. No training or improvement claim yet.
