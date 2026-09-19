@@ -65,6 +65,15 @@ decided: `nanochat/flash_attention.py` is outside the spec 9.1 file list and the
 what "stock" means in the Phase 0 gate. Awaiting the author's decision. CPU-side work (model,
 tests T1-T7) does not depend on it.
 
+**Resolution (same day, authorised by the author: "you can modify the files to force sdpa").**
+`_load_flash_attention_3` now returns `None` when the compute capability major is >= 10, which
+is what the comment already in that function says Blackwell needs. After the change:
+`HAS_FA3 = False`, `USE_FA3 = False` on this GPU, and `tests/test_attention_fallback.py` +
+`tests/test_engine.py` pass with the GPU visible (13 passed, 10 skipped; the skips are the
+FA3-only comparisons). This is a DEVIATION from pinned `92d63d4` in a file outside spec 9.1, in
+its own commit. It applies identically to every arm, including the stock d12 reference, so
+"stock" in the Phase 0 gate means `92d63d4` + this gate. To be stated in the paper.
+
 ### Conflicts and ambiguities found in spec section 9, with the resolution adopted
 
 Spec 9.0 requires conflicts to be reported rather than silently resolved. These were reported to

@@ -37,42 +37,6 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # Looped (weight-shared depth) layout "P,KxR,C": the n_layer unique blocks are stored in the
-    # order prelude, core, coda, and the core is applied n_loop times per forward pass.
-    # n_prelude = -1 (default) is stock behavior: all n_layer blocks applied once.
-    n_prelude: int = -1
-    n_core: int = 0
-    n_coda: int = 0
-    n_loop: int = 1 # default loop count R, used when no override is given via set_num_loops
-
-    def __post_init__(self):
-        if self.n_prelude >= 0:
-            assert self.n_core >= 0 and self.n_coda >= 0 and self.n_loop >= 1, f"Invalid layout: {self}"
-            assert self.n_prelude + self.n_core + self.n_coda == self.n_layer, \
-                f"n_prelude + n_core + n_coda = {self.n_prelude} + {self.n_core} + {self.n_coda} != n_layer = {self.n_layer}"
-
-
-def parse_layout(layout):
-    """
-    Parse a layout string into GPTConfig fields.
-    "P,KxR,C" => P prelude blocks, K core blocks applied R times, C coda blocks, e.g. "2,4x2,2".
-    "N"       => plain N-layer model expressed through the layout fields (all prelude, no core).
-    """
-    try:
-        parts = layout.split(",")
-        if len(parts) == 1:
-            n_prelude, n_core, n_loop, n_coda = int(parts[0]), 0, 1, 0
-            valid = n_prelude >= 1
-        else:
-            prelude, core, coda = parts
-            k, r = core.split("x")
-            n_prelude, n_core, n_loop, n_coda = int(prelude), int(k), int(r), int(coda)
-            valid = n_prelude >= 0 and n_core >= 1 and n_loop >= 1 and n_coda >= 0
-    except ValueError:
-        valid = False
-    if not valid:
-        raise ValueError(f"Invalid layout '{layout}'. Use 'P,KxR,C' (e.g. '2,4x2,2') or 'N' (e.g. '12').")
-    return dict(n_layer=n_prelude + n_core + n_coda, n_prelude=n_prelude, n_core=n_core, n_coda=n_coda, n_loop=n_loop)
 
 
 def norm(x):
@@ -117,10 +81,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, cache_idx):
-        # cache_idx is the *effective* layer index of this visit. In a looped model the same block
-        # sees a different input on every visit, so each visit needs its own KV cache slot.
-        # Without looping it is equal to self.layer_idx.
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -149,7 +110,7 @@ class CausalSelfAttention(nn.Module):
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(cache_idx)
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
@@ -158,7 +119,7 @@ class CausalSelfAttention(nn.Module):
                 window_size=window_size,
             )
             # Advance position after last layer processes
-            if cache_idx == kv_cache.n_layers - 1:
+            if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
@@ -186,8 +147,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, cache_idx):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cache_idx)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -201,12 +162,9 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
-        # Loop count R for looped layouts. Deliberately a plain Python int and not a tensor, so that
-        # torch.compile(dynamic=False) specializes (and guards) one graph per R. See set_num_loops.
-        self.num_loops = config.n_loop
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
-        self._window_sizes = self._compute_window_sizes(config)
+        self.window_sizes = self._compute_window_sizes(config)
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -339,9 +297,6 @@ class GPT(nn.Module):
         """
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
-        # Layouts only support full context everywhere: how a window pattern should tile across
-        # loop iterations is undefined, and a per-visit window would confound looped comparisons.
-        assert config.n_prelude < 0 or pattern == "L", f"Layouts require window_pattern 'L', got '{pattern}'"
         # Map characters to window sizes
         long_window = config.sequence_len
         short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
@@ -361,44 +316,9 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def set_num_loops(self, num_loops):
-        """
-        Set the loop count R used by forward(). Must stay a plain Python int (see __init__):
-        under torch.compile every distinct value compiles its own graph.
-        A no-op for models without a core (stock, or plain "N" layouts).
-        """
-        assert isinstance(num_loops, int) and num_loops >= 1, f"num_loops must be a positive int, got {num_loops!r}"
-        self.num_loops = num_loops
-
-    def visit_schedule(self, num_loops=None):
-        """
-        The unique-layer index visited at each effective layer, for loop count R (default: current).
-        e.g. layout 2,4x2,2 => [0,1, 2,3,4,5, 2,3,4,5, 6,7]. Its length is the effective depth E.
-        """
-        c = self.config
-        if c.n_prelude < 0:
-            return list(range(c.n_layer)) # stock: every block applied once
-        num_loops = self.num_loops if num_loops is None else num_loops
-        prelude = list(range(c.n_prelude))
-        core = list(range(c.n_prelude, c.n_prelude + c.n_core))
-        coda = list(range(c.n_prelude + c.n_core, c.n_layer))
-        return prelude + core * num_loops + coda
-
-    def get_window_sizes(self, num_loops=None):
-        """Window size per *effective* layer. Layouts are full context everywhere (asserted at init)."""
-        if self.config.n_prelude < 0:
-            return self._window_sizes
-        return [(self.config.sequence_len, 0)] * len(self.visit_schedule(num_loops))
-
-    @property
-    def window_sizes(self):
-        return self.get_window_sizes()
-
-    def estimate_flops(self, num_loops=None):
+    def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
-        For looped layouts this is for loop count num_loops (default: the current one): a shared
-        block costs its matmuls on every visit, and attention is paid at every effective layer.
         Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
         Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
         On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
@@ -411,27 +331,21 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.get_window_sizes(num_loops):
+        for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params(num_loops) + attn_flops
+        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
         return num_flops_per_token
 
-    def num_matmul_params(self, num_loops=None):
+    def num_matmul_params(self):
         """
         The number of parameters that participate in matmuls with the token stream,
         i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
         matmul in this model goes through the Linear class, while non-matmul params
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
-        This is a compute count, not a storage count: a block's matmuls (incl. its ve_gate) are
-        counted once per *visit*, so a looped model counts its core blocks num_loops times.
-        Without looping every block is visited once and this is just the sum over all Linears.
         """
-        count = lambda module: sum(m.weight.numel() for m in module.modules() if isinstance(m, Linear))
-        block_params = [count(block) for block in self.transformer.h]
-        non_block_params = count(self) - sum(block_params) # lm_head, smear_gate
-        matmul_params = non_block_params + sum(block_params[u] for u in self.visit_schedule(num_loops))
+        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
@@ -458,11 +372,10 @@ class GPT(nn.Module):
         return prefill_flops
 
     def kv_bytes_per_token(self):
-        """Bytes to *store* one token of KV cache during inference, per row (all layers).
-        There is one cache slot per *effective* layer: a looped block caches K/V on every visit."""
+        """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
-        return len(self.visit_schedule()) * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
+        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
         """Bytes of KV cache *read* by one decode step at a given context length, per row.
@@ -494,9 +407,6 @@ class GPT(nn.Module):
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
-        # All of the above are *unique* (stored) parameter counts. Weight sharing changes the
-        # compute (see num_matmul_params), not these. Note that value_embeds scale with the number
-        # of unique layers that carry one, so they must be reported separately from the blocks.
         return {
             'wte': wte,
             'value_embeds': value_embeds,
@@ -504,8 +414,6 @@ class GPT(nn.Module):
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
             'total': total,
-            'unique_layers': self.config.n_layer,
-            'effective_layers': len(self.visit_schedule()),
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
@@ -548,9 +456,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', diag=None):
-        # diag: optional list for diagnostics. If given, the residual stream RMS after every
-        # effective layer is appended to it. Only pass it to the uncompiled model under no_grad.
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -586,26 +492,16 @@ class GPT(nn.Module):
                 x = x + gate * x_pre_smear
 
         # Forward the trunk of the Transformer
-        # e is the effective layer index (0..E-1), u the unique layer visited there. Everything
-        # that holds parameters (blocks, per-layer scalars, value embeddings) is indexed by u and
-        # therefore shared across loop iterations; windows, backout and KV cache slots go by e.
-        # Without looping the schedule is range(n_layer) and e == u.
         x0 = x  # save initial normalized embedding for x0 residual
-        schedule = self.visit_schedule()
-        window_sizes = self.get_window_sizes()
-        n_effective = len(schedule)
-        assert kv_cache is None or kv_cache.n_layers == n_effective, \
-            f"KV cache has {kv_cache.n_layers} layers but the model has {n_effective} effective layers (num_loops={self.num_loops})"
-        backout_layer = n_effective // 2  # cache at halfway point
+        n_layer = self.config.n_layer
+        backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        for e, u in enumerate(schedule):
-            x = self.resid_lambdas[u] * x + self.x0_lambdas[u] * x0
-            ve = self.value_embeds[str(u)](idx).to(x.dtype) if str(u) in self.value_embeds else None
-            x = self.transformer.h[u](x, ve, cos_sin, window_sizes[e], kv_cache, e)
-            if e == backout_layer:
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if i == backout_layer:
                 x_backout = x
-            if diag is not None:
-                diag.append(x.float().square().mean(dim=-1).sqrt().mean().item())
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout

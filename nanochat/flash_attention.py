@@ -28,6 +28,12 @@ def _load_flash_attention_3():
         major, _ = torch.cuda.get_device_capability()
         # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
         # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
+        # has_kernel() below only checks that a build exists for this torch/CUDA/OS, not that it
+        # contains a kernel image for this GPU: on Blackwell (sm100/sm120) it returns True and the
+        # first FA3 call then aborts the process with "no kernel image is available for execution
+        # on the device". So gate on the compute capability explicitly.
+        if major >= 10:
+            return None
         import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel, has_kernel
