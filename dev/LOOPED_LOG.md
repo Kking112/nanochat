@@ -108,3 +108,67 @@ and approved by the author before implementation.
    state, a required `--model-tag` whenever `--layout` is given (the stock default tag is
    `d{depth}`, which would make every arm overwrite one directory), `runs/looped_common.sh`, and
    `scripts/looped_select_lr.py`.
+
+### Implementation (same session)
+
+Built on branch `looped` (feature branches `looped-model`, `looped-train`, `looped-runs`; git cannot
+hold `looped` and `looped/model` at once, hence the dashes).
+
+- `nanochat/gpt.py`: `GPTConfig.n_prelude/n_core/n_coda/n_loop`, `parse_layout`, `visit_schedule`,
+  `set_num_loops`; forward iterates the schedule (parameters by unique layer `u`; window, backout at
+  `E // 2` and KV cache slot by effective index `e`); `diag` list for per-layer residual RMS;
+  per-visit FLOP accounting, E-based KV accounting.
+- `nanochat/engine.py`: one KV cache slot per effective layer. `nanochat/checkpoint_manager.py`:
+  stock defaults for the new config keys.
+- `scripts/base_train.py`: `--layout --width-depth --ref-layout --horizon-frac --matrix-lr-mult
+  --seed --train-loops --arm --results-dir --no-save-optimizer`. `scripts/base_eval.py`:
+  `--num-loops`, outputs keyed by model tag and R.
+- Tests T1-T9 in `tests/test_looped.py` (68 passed, 10 skipped FA3-only, full suite). The model
+  tests were mutation-checked: cache slot by `u` instead of `e` (T4 fails), backout at
+  `n_layer // 2` (T3, T7 fail), FLOPs counted once per unique block (T6 fails).
+- T8/T9 run `scripts.base_train` on CPU with `TORCHDYNAMO_DISABLE=1`: CPU inductor needs
+  `setuptools`, which only nanochat's `cpu` extra installs. Compiled behaviour is covered by the
+  GPU smoke below instead.
+- T8 caught a real bug during development: the data hash depended on the micro-batch size
+  (inputs-then-targets per micro-batch, and the loader's one-batch prefetch past the last step).
+  The hash is now row-wise and capped at the rows the run trains on.
+
+### GPU smoke (30-60 steps per arm, scratch base dir and results dir, nothing in `results/`)
+
+All arms: identical data hash, identical full-horizon `num_iterations` = 2520 (1.32B tokens),
+batch 524,288, weight decay 0.28, LR batch scale 1. No recompile-limit failures, including the
+random-R arm (4 training graphs, compiled before the timed loop).
+
+| arm | layout | U / E | FLOPs/token | block params | value-embed params | tok/s (steady) | peak VRAM |
+|---|---|---|---|---|---|---|---|
+| stock d12 | `--depth 12` | 12 / 12 | 8.871e8 | 84.9M | 151.0M | ~268k | 28.8 GB |
+| B12 | `12` | 12 / 12 | 8.871e8 | 84.9M | 151.0M | ~266k | 28.8 GB |
+| B8 | `8` | 8 / 8 | 6.417e8 | 56.6M | 100.7M | ~360k | 20.9 GB |
+| B6 | `6` | 6 / 6 | 5.191e8 | 42.5M | 75.5M | ~446k | 16.9 GB |
+| L8 | `2,4x2,2` | 8 / 12 | 8.871e8 | 56.6M | 100.7M | ~263k | 28.2 GB |
+| L6s | `2,2x4,2` | 6 / 12 | 8.871e8 | 42.5M | 75.5M | ~264k | 27.9 GB |
+| L6p | `0,6x2,0` | 6 / 12 | 8.871e8 | 42.5M | 75.5M | ~264k | 27.9 GB |
+| LR | `2,4xR,2`, R~U{1..4} | 8 / 8-20 | 6.4e8-1.38e9 | 56.6M | 100.7M | ~239k mean | 42.8 GB |
+
+- L8, L6s, L6p have exactly B12's FLOPs per token (T6's "ve_gate only" difference is 0: each has
+  6 value-embedding visits) and B12's throughput. LR step time scales with R: ~1.4 / 2.0 / 2.5 /
+  3.0 s for R = 1..4.
+- **Revised compute estimate.** A B12-equivalent run is ~2520 x 1.97 s = ~83 min of training, plus
+  11 val evals. The proposal guessed 3-5 h. Phase 1 (21 sweep runs at 40% + 21 main runs) is
+  therefore on the order of 2 GPU-days, not 5. To be replaced by the Phase 0 measurement.
+- **Training on this GPU is not run-to-run deterministic**, on unmodified stock code too: two
+  identical stock runs log the same loss for ~5 steps and then differ in the 5th-6th digit (final
+  loss of 30 steps: 6.450897 vs 6.451034). Stock vs `--layout 12` differ by the same amount
+  (6.450897 vs 6.450961). Consequences: (a) the Phase 0 "identical losses" check under
+  torch.compile is a tolerance check (1e-3), exact equality is proven in fp32 by T1/T2;
+  (b) "a seed changes parameter initialization only" holds for the inputs of a run, but seed
+  variance as measured will include this nondeterminism. To be stated in the paper.
+- One L8 smoke run showed 17 consecutive steps at 2x the step time, with normal speed before and
+  after: something else used the GPU (this is a desktop workstation). The results row therefore
+  also records `tokens_per_sec_median`, which is robust to that; the table above is steady state.
+- `base_eval --num-loops` on the LR smoke checkpoint at R = 1, 2, 3, 5 (5 is beyond the trained
+  range) runs, R = 2 reproduces the in-training val_bpb, sampling through the Engine KV cache works
+  at every R, and a non-looped model is rejected. `infer_bench` on L8 vs B8: 2.62 vs 1.81 ms per
+  decoded token (~ 12/8 layers), KV capacity ~ 8/12.
+- CORE with a small `--max-per-task` (8) crashes in stock `core_eval` on 10-shot tasks (few-shot
+  examples are sampled from the truncated set). Not touched; the study uses 500.

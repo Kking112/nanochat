@@ -134,6 +134,8 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--num-loops', type=int, default=-1, help='looped models: evaluate with this loop count R instead of the one in the model config (-1 = model config). Appends a row to <results-dir>/looped_loopsweep.csv')
+    parser.add_argument('--results-dir', type=str, default='results', help='where --num-loops appends its results row')
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -152,6 +154,15 @@ def main():
     token_bytes = get_token_bytes(device=device)
     model_name = f"base_model (step {meta['step']})"
     model_slug = f"base_model_{meta['step']:06d}"
+    if args.num_loops > 0:
+        assert args.model_tag is not None, "--num-loops requires an explicit --model-tag"
+        assert model.config.n_core > 0, f"--num-loops needs a looped model, {args.model_tag} has no core blocks"
+        model.set_num_loops(args.num_loops) # Engine sizes its KV cache from this too
+    if model.config.n_prelude >= 0:
+        # The arms of a study share their step count: key the outputs by model tag and loop count
+        # as well, so that arms and loop counts do not overwrite each other
+        model_name = f"{args.model_tag} (step {meta['step']}, R={model.num_loops})"
+        model_slug = f"{args.model_tag}_{meta['step']:06d}_R{model.num_loops}"
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
@@ -235,6 +246,28 @@ def main():
                 f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
             print0(f"\nResults written to: {output_csv_path}")
             print0(f"CORE metric: {core_results['core_metric']:.4f}")
+
+    # Loop sweep of the looped study: one appended row per (model, R). Past rows are never edited.
+    if args.num_loops > 0 and ddp_rank == 0:
+        trained_as = meta.get("user_config", {})
+        row = {
+            "arm": trained_as.get("arm"), "layout": trained_as.get("layout"), "seed": trained_as.get("seed"),
+            "train_loops": trained_as.get("train_loops"), "model_tag": args.model_tag, "step": meta["step"],
+            "num_loops": model.num_loops, "effective_layers": len(model.visit_schedule()),
+            "val_bpb": bpb_results.get("val"), "train_bpb": bpb_results.get("train"),
+            "core": core_results["core_metric"] if core_results is not None else None,
+            "split_tokens": args.split_tokens, "max_per_task": args.max_per_task,
+            "decode_flops_per_token_ctx1024": model.estimate_decode_flops(1024),
+        }
+        os.makedirs(args.results_dir, exist_ok=True)
+        sweep_csv_path = os.path.join(args.results_dir, "looped_loopsweep.csv")
+        write_header = not os.path.exists(sweep_csv_path)
+        with open(sweep_csv_path, 'a', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        print0(f"Appended loop sweep row to {sweep_csv_path}")
 
     compute_cleanup()
 
