@@ -346,3 +346,101 @@ def test_old_checkpoint_config_gets_stock_layout_defaults():
     looped = dict(old, **gpt_module.parse_layout("1,2x2,1"))
     _patch_missing_config_keys(looped) # must not clobber a looped checkpoint's layout
     assert GPTConfig(**looped).n_core == 2
+
+
+# -----------------------------------------------------------------------------
+# T8 / T9: the training script, as a subprocess on CPU
+
+import csv
+import json
+import os
+import re
+import subprocess
+import sys
+
+REPO = Path(__file__).parent.parent
+REAL_BASE_DIR = Path(os.environ.get("NANOCHAT_BASE_DIR", Path.home() / ".cache" / "nanochat"))
+needs_data = pytest.mark.skipif(
+    not (REAL_BASE_DIR / "tokenizer" / "tokenizer.pkl").exists() or not list((REAL_BASE_DIR / "base_data_climbmix").glob("*.parquet")),
+    reason="needs the trained tokenizer and the pretraining data shards in the nanochat base dir")
+
+
+def run_base_train(tmp_path, tag, *args):
+    """
+    Run a 20 step scripts.base_train on CPU. Checkpoints go to a scratch base dir that only links
+    the real tokenizer and data, and results to a scratch results dir: a test must never touch
+    the results file of the study.
+    No GPU => fp32 and SDPA. Dynamo is disabled because CPU inductor needs setuptools, which the
+    gpu environment does not install; compiled-graph behavior is checked in the GPU smoke runs.
+    """
+    base_dir, results_dir = tmp_path / "base", tmp_path / f"results_{tag}"
+    base_dir.mkdir(exist_ok=True)
+    for name in ("tokenizer", "base_data_climbmix"):
+        if not (base_dir / name).exists():
+            (base_dir / name).symlink_to(REAL_BASE_DIR / name)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", TORCHDYNAMO_DISABLE="1", NANOCHAT_BASE_DIR=str(base_dir))
+    cmd = [sys.executable, "-m", "scripts.base_train", "--window-pattern", "L", "--max-seq-len", "256",
+        "--total-batch-size", "1024", "--num-iterations", "20", "--eval-every", "10", "--eval-tokens", "4096",
+        "--core-metric-every", "-1", "--sample-every", "-1", "--no-save-optimizer",
+        "--model-tag", f"looped_test_{tag}", "--arm", tag, "--results-dir", str(results_dir), *args]
+    proc = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    with open(results_dir / "looped_results.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    logs = list((results_dir / "logs").glob("*.jsonl"))
+    assert len(logs) == 1
+    events = [json.loads(line) for line in logs[0].read_text().splitlines()]
+    losses = [float(x) for x in re.findall(r"^step \d+/\d+ .*? loss: ([\d.]+)", proc.stdout, flags=re.M)]
+    return rows[0], events, losses
+
+
+@needs_data
+@pytest.mark.slow
+def test_t8_data_order_is_independent_of_seed(tmp_path):
+    """--seed changes the parameter init and nothing else: not the data, not the loop counts."""
+    layout = ["--layout", "1,2x2,1", "--width-depth", "4", "--train-loops", "1,2,3"]
+    a, events_a, _ = run_base_train(tmp_path, "seed0", *layout, "--seed", "0", "--device-batch-size", "2")
+    b, events_b, _ = run_base_train(tmp_path, "seed1", *layout, "--seed", "1", "--device-batch-size", "2")
+    # the hash counts rows, not micro-batches, so it may not depend on the device batch size either
+    c, _, _ = run_base_train(tmp_path, "seed1_b1", *layout, "--seed", "1", "--device-batch-size", "1")
+    assert a["data_sha256"] == b["data_sha256"] == c["data_sha256"]
+    assert a["data_hash_rows"] == b["data_hash_rows"] == c["data_hash_rows"] != "0"
+    config = lambda events: next(e for e in events if e["kind"] == "config")
+    assert config(events_a)["loop_schedule_sha256"] == config(events_b)["loop_schedule_sha256"]
+    assert a["train_flops"] == b["train_flops"]
+    assert a["final_val_bpb"] != b["final_val_bpb"] # different init
+    # same seed, same data, only the micro-batch size differs: the same run up to float summation order
+    assert float(b["final_val_bpb"]) == pytest.approx(float(c["final_val_bpb"]), abs=1e-3)
+
+
+@needs_data
+@pytest.mark.slow
+@pytest.mark.parametrize("tag,args", [
+    ("plain", ["--layout", "4", "--width-depth", "4"]),
+    ("looped", ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "4"]),
+    ("random_r", ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "4", "--train-loops", "1,2,3"]),
+])
+def test_t9_smoke(tmp_path, tag, args):
+    row, events, losses = run_base_train(tmp_path, tag, *args, "--seed", "0", "--device-batch-size", "2")
+    # 20 steps are all inside the LR warmup and batches are 1024 tokens, so the loss falls slowly
+    # and noisily: compare the first and last five steps rather than two single steps
+    assert len(losses) == 20 and sum(losses[-5:]) / 5 < sum(losses[:5]) / 5 - 0.01, losses
+    assert row["diverged"] == "0" and row["steps"] == "20" and row["tokens"] == str(20 * 1024)
+    kinds = [e["kind"] for e in events]
+    assert kinds[0] == "config" and kinds[-1] == "final" and kinds.count("eval") == 3 and kinds.count("diag") == 3
+    config, final = events[0], events[-1]
+    E = config["param_counts"]["effective_layers"]
+    assert E == (4 if tag == "plain" else 6)
+    assert len(final["resid_lambdas"]) == len(final["x0_lambdas"]) == 4 # per unique layer
+    diag = next(e for e in events if e["kind"] == "diag")["residual_rms"]
+    if tag == "random_r":
+        assert {r: len(v) for r, v in diag.items()} == {"1": 4, "2": 6, "3": 8} # one entry per effective layer, for every trained R
+        per_token = config["flops_per_token_at_loops"]
+        assert per_token["1"] < per_token["2"] < per_token["3"]
+        assert per_token["1"] * 20 * 1024 < int(row["train_flops"]) < per_token["3"] * 20 * 1024
+    else:
+        assert list(diag) == [str(config["model_config"]["n_loop"])] and len(diag[list(diag)[0]]) == E
+        assert int(row["train_flops"]) == config["num_flops_per_token"] * 20 * 1024
+    train = next(e for e in events if e["kind"] == "train")
+    assert train["grad_norm_noncore"] > 0 and (train["grad_norm_core"] > 0) == (tag != "plain")

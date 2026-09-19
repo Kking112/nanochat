@@ -14,10 +14,14 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
+import csv
 import json
 import time
 import math
+import random
+import hashlib
 import argparse
+import subprocess
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -25,7 +29,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, parse_layout
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -77,8 +81,27 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Looped (weight-shared depth) study, see looped_nanochat_proposal.md section 9.5. All off by default.
+parser.add_argument("--layout", type=str, default="", help="'P,KxR,C' = P prelude, K core blocks applied R times, C coda blocks (e.g. '2,4x2,2'), or 'N' = plain N-layer model. Replaces --depth.")
+parser.add_argument("--width-depth", type=int, default=12, help="with --layout: model_dim = width_depth * aspect_ratio (the role --depth plays for the width)")
+parser.add_argument("--ref-layout", type=str, default="", help="with --layout: derive horizon, batch size, LR batch scaling and weight decay scaling from a model of this layout instead of from this model, so they are identical across arms")
+parser.add_argument("--horizon-frac", type=float, default=1.0, help="with --layout: train for this fraction of the horizon. Only shortens num_iterations: batch size, LR scale and weight decay stay those of the full horizon")
+parser.add_argument("--matrix-lr-mult", type=float, default=1.0, help="multiplier on --matrix-lr")
+parser.add_argument("--seed", type=int, default=-1, help="seed for parameter init only, data order is not affected (-1 = leave the global default seed alone)")
+parser.add_argument("--train-loops", type=str, default="", help="with --layout: comma-separated loop counts, e.g. '1,2,3,4'. One is sampled uniformly per optimizer step. Evaluation uses the layout's own R.")
+parser.add_argument("--arm", type=str, default="", help="name of the study arm. If given, the run is logged to <results-dir>/logs/*.jsonl and appended as one row to <results-dir>/looped_results.csv")
+parser.add_argument("--results-dir", type=str, default="results", help="where --arm writes its results")
+parser.add_argument("--no-save-optimizer", action="store_true", help="do not save optimizer state in checkpoints (saves disk, the run can then not be resumed)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+if args.layout:
+    # the default tag is d{depth}: every arm would overwrite the same directory, and evals that
+    # guess the model tag prefer d<number> directories
+    assert args.model_tag, "--layout requires an explicit --model-tag"
+else:
+    assert not (args.ref_layout or args.train_loops or args.horizon_frac != 1.0), "--ref-layout, --train-loops and --horizon-frac require --layout"
+train_loops = sorted({int(r) for r in args.train_loops.split(",")}) if args.train_loops else []
+script_t0 = time.time()
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -126,28 +149,39 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+def build_model_meta(depth, layout=None):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data).
+    With a layout, depth only sets the width and the layout sets the (unique) layers."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    layer_kwargs = parse_layout(layout) if layout else dict(n_layer=depth)
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        window_pattern=args.window_pattern, **layer_kwargs,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
     return model_meta
 
 # Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+if args.layout:
+    model = build_model_meta(args.width_depth, args.layout)
+else:
+    model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+if args.seed >= 0:
+    # init_weights is the only consumer of the global RNG (dataloader, optimizer and evals use
+    # none or their own), so the seed changes the parameter init and nothing else
+    torch.manual_seed(args.seed)
+    if device_type == "cuda":
+        torch.cuda.manual_seed(args.seed)
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
@@ -243,6 +277,12 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+if args.layout:
+    # The loop count is a Python int attribute of the model, so every distinct R compiles its own
+    # graph (on top of the train/eval graphs). Make room, and make running out an error instead
+    # of a silent fall back to eager mode.
+    torch._dynamo.config.recompile_limit = 64
+    torch._dynamo.config.fail_on_recompile_limit_hit = True
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
@@ -266,7 +306,14 @@ def get_scaling_params(m):
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
-target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
+# The horizon, and with it the batch size, LR scaling and weight decay scaling below, normally derive
+# from the model's own size. With --ref-layout they derive from a reference model instead, so that
+# they come out identical for every arm of a study no matter how many parameters the arm has.
+horizon_scaling_params = num_scaling_params
+if args.ref_layout:
+    horizon_scaling_params = get_scaling_params(build_model_meta(args.width_depth, args.ref_layout))
+    print0(f"Horizon and derived hyperparameters use reference layout {args.ref_layout}: {horizon_scaling_params:,} scaling params (this model: {num_scaling_params:,})")
+target_tokens = int(args.target_param_data_ratio * horizon_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
 d12_ref = build_model_meta(12) # creates the model on meta device
@@ -311,7 +358,7 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
+    matrix_lr=args.matrix_lr * args.matrix_lr_mult * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
 
@@ -351,6 +398,12 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
+if args.horizon_frac != 1.0:
+    # Shorten the run only. Everything derived from the horizon above (batch size, LR scale, weight
+    # decay) deliberately stays at its full-horizon value, the schedules below span the short run.
+    assert args.num_iterations <= 0 and args.target_flops <= 0, "--horizon-frac applies to the data:param ratio horizon only"
+    num_iterations = round(num_iterations * args.horizon_frac)
+    print0(f"Horizon fraction {args.horizon_frac}: training for {num_iterations:,} iterations")
 total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
@@ -386,6 +439,90 @@ def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
+# Looped study: per-step loop counts, FLOPs accounting, results logging, diagnostics
+
+# Random loop count training: the R of every optimizer step is fixed up front, from an RNG that is
+# independent of --seed, so every seed (and a resumed run) sees the same sequence of R.
+LOOP_SCHEDULE_SEED = 1337
+loop_rng = random.Random(LOOP_SCHEDULE_SEED)
+loop_schedule = [loop_rng.choice(train_loops) for _ in range(num_iterations)] if train_loops else None
+# FLOPs per token depend on R, so training FLOPs are accumulated with the R actually used per step
+flops_per_token_at = {r: orig_model.estimate_flops(num_loops=r) for r in train_loops}
+def get_flops_per_token(it):
+    return flops_per_token_at[loop_schedule[it]] if loop_schedule else num_flops_per_token
+def get_flops_so_far(it):
+    if loop_schedule:
+        return total_batch_size * sum(flops_per_token_at[r] for r in loop_schedule[:it])
+    return num_flops_per_token * total_batch_size * it
+def set_eval_loops():
+    # evaluation always uses the layout's own R, whatever the last training step used
+    if loop_schedule:
+        orig_model.set_num_loops(model_config.n_loop)
+
+# Data order check: hash the first rows of the training stream. Counted in rows and not in
+# micro-batches, so that the hash does not depend on --device-batch-size.
+# Capped at the rows the run trains on: the loader prefetches one micro-batch past the last step,
+# and those extra rows do depend on the micro-batch size.
+DATA_HASH_ROWS = min(320, num_iterations * total_batch_size // args.max_seq_len)
+data_hasher, data_hash_rows = hashlib.sha256(), 0
+def hash_data(inputs, targets):
+    # called on receipt of every batch: the dataloader reuses its buffers
+    global data_hash_rows
+    n = min(len(inputs), DATA_HASH_ROWS - data_hash_rows)
+    if n > 0 and not resuming:
+        rows = torch.cat([inputs[:n], targets[:n]], dim=1).cpu().numpy() # row by row: (input, target) pairs
+        data_hasher.update(rows.tobytes())
+        data_hash_rows += n
+hash_data(x, y)
+
+# Core blocks are the ones that are visited more than once
+core_layers = range(model_config.n_prelude, model_config.n_prelude + model_config.n_core) if model_config.n_prelude >= 0 else range(0)
+def get_grad_norms():
+    """Gradient norm of the matrices of the core blocks vs those of all other blocks."""
+    sq = {True: [], False: []}
+    for u, block in enumerate(orig_model.transformer.h):
+        sq[u in core_layers].extend(p.grad.float().square().sum() for p in block.parameters() if p.grad is not None)
+    norm_of = lambda terms: torch.stack(terms).sum().sqrt().item() if terms else 0.0
+    return {"grad_norm_core": norm_of(sq[True]), "grad_norm_noncore": norm_of(sq[False])}
+
+study = bool(args.arm) and master_process # log this run as an arm of the study
+if study:
+    from nanochat.flash_attention import USE_FA3 as attn_is_fa3
+    git = lambda *cmd: subprocess.run(["git", *cmd], capture_output=True, text=True).stdout.strip()
+    git_hash = git("rev-parse", "HEAD") + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
+    run_id = f"{output_dirname}_{time.strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(os.path.join(args.results_dir, "logs"), exist_ok=True)
+    jsonl_path = os.path.join(args.results_dir, "logs", f"{run_id}.jsonl")
+    assert not os.path.exists(jsonl_path), f"refusing to overwrite the log of a past run: {jsonl_path}"
+    # a fixed batch of validation rows for the residual stream diagnostics
+    diag_x = next(build_val_loader())[0][:4].clone()
+def log_event(kind, **data):
+    if study:
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": kind, **data}) + "\n")
+
+param_counts_table = {
+    "unique block params": param_counts["transformer_matrices"], "lm_head": param_counts["lm_head"], "wte": param_counts["wte"],
+    "value embed params (lookups, no FLOPs)": param_counts["value_embeds"], "scalars": param_counts["scalars"],
+    "unique layers U": param_counts["unique_layers"], "effective layers E": param_counts["effective_layers"],
+    "FLOPs per token": num_flops_per_token,
+}
+print0("Parameter table:")
+for key, value in param_counts_table.items():
+    print0(f"  {key:40s}: {value:,}")
+log_event("config",
+    run_id=run_id if study else None, arm=args.arm, layout=args.layout, ref_layout=args.ref_layout, seed=args.seed,
+    git_hash=git_hash if study else None, user_config=user_config, model_config=model_config_kwargs, param_counts=param_counts,
+    num_flops_per_token=num_flops_per_token, flops_per_token_at_loops=flops_per_token_at,
+    attention="fa3" if study and attn_is_fa3 else "sdpa", compute_dtype=str(COMPUTE_DTYPE),
+    gpu=torch.cuda.get_device_name(0) if device_type == "cuda" else device_type, torch_version=torch.__version__,
+    num_iterations=num_iterations, total_batch_size=total_batch_size, target_tokens=target_tokens,
+    batch_lr_scale=batch_lr_scale, weight_decay_scaled=weight_decay_scaled, matrix_lr=args.matrix_lr * args.matrix_lr_mult * batch_lr_scale,
+    train_loops=train_loops, loop_schedule_seed=LOOP_SCHEDULE_SEED,
+    loop_schedule_sha256=hashlib.sha256(bytes(loop_schedule)).hexdigest() if loop_schedule else None,
+)
+
+# -----------------------------------------------------------------------------
 # Training loop
 
 # Loop state (variables updated by the training loop)
@@ -412,10 +549,25 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+if loop_schedule:
+    # Compile the training graph of every R now. Otherwise the first use of an R would recompile
+    # in the middle of the run and distort the timings. No optimizer step, no data consumed.
+    for r in train_loops:
+        orig_model.set_num_loops(r)
+        model(x, y).backward()
+        print0(f"Compiled training graph for R={r}")
+    model.zero_grad(set_to_none=True)
+
+val_bpb_history = {} # step -> val bpb
+step_times = [] # seconds per step, after the first 10 steps
+final_core_metric = None
+diverged = False
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    flops_so_far = get_flops_so_far(step)
+    set_eval_loops()
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -427,12 +579,26 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
+        val_bpb_history[step] = val_bpb
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
+        log_event("eval", step=step, val_bpb=val_bpb, total_training_flops=flops_so_far, total_training_time=total_training_time)
+        if study:
+            # Residual stream RMS after every effective layer (mean over batch and positions), for
+            # each loop count of interest. The end of core iteration i of a P,KxR,C layout is
+            # entry P + K*(i+1) - 1. Uncompiled model: this must not touch the compiled graphs.
+            residual_rms = {}
+            with torch.no_grad(), disable_fp8(orig_model):
+                for r in (train_loops or [model_config.n_loop]):
+                    orig_model.set_num_loops(r)
+                    residual_rms[r] = []
+                    orig_model(diag_x, diag=residual_rms[r])
+            orig_model.set_num_loops(model_config.n_loop)
+            log_event("diag", step=step, residual_rms=residual_rms)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -444,6 +610,8 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        final_core_metric = results["core_metric"]
+        log_event("core", step=step, core_metric=results["core_metric"], centered_results=results["centered_results"])
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -479,7 +647,7 @@ while True:
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
+            None if args.no_save_optimizer else optimizer.state_dict(), # optimizer state
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -507,6 +675,8 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    if loop_schedule:
+        orig_model.set_num_loops(loop_schedule[step]) # the same R for all micro-batches of this step
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -516,6 +686,8 @@ while True:
         else:
             loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        hash_data(x, y)
+    grad_norms = get_grad_norms() if study and step % 100 == 0 else {} # before the optimizer touches the grads
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -550,10 +722,11 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    flops_per_sec = get_flops_per_token(step) * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
+        step_times.append(dt)
     # Calculate ETA based on average time per step (excluding first 10 steps)
     steps_done = step - 10
     if steps_done > 0:
@@ -578,6 +751,13 @@ while True:
             "train/epoch": epoch,
         }
         wandb_run.log(log_data)
+        log_event("train", **log_data, **grad_norms, num_loops=orig_model.num_loops)
+
+    # A diverged run is a result of the study: record it and stop, do not try to rescue it
+    if not math.isfinite(train_loss_f):
+        print0(f"Step {step:05d} | training loss is {train_loss_f}: run diverged, stopping")
+        diverged = True
+        break
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
@@ -598,6 +778,39 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+
+# Looped study: one row per run, appended. Rows of past runs are never edited.
+if study:
+    final_val_bpb = float("nan") if diverged else val_bpb_history.get(step)
+    # the second divergence criterion of the study: the final bpb is above the step-500 value
+    steps_from_500 = [it for it in sorted(val_bpb_history) if it >= 500]
+    val_bpb_at_500 = val_bpb_history[steps_from_500[0]] if steps_from_500 and steps_from_500[0] < step else None
+    if not diverged and final_val_bpb is not None and val_bpb_at_500 is not None:
+        diverged = final_val_bpb > val_bpb_at_500
+    timed_steps = max(step - 1 - 10, 0) # total_training_time skips the first 10 steps
+    row = {
+        "arm": args.arm, "layout": args.layout or str(args.depth), "seed": args.seed, "lr_mult": args.matrix_lr_mult,
+        "horizon_frac": args.horizon_frac, "steps": step, "tokens": total_batch_size * step,
+        "train_flops": get_flops_so_far(step), "final_val_bpb": final_val_bpb, "core": final_core_metric,
+        "tokens_per_sec": round(timed_steps * total_batch_size / total_training_time) if total_training_time > 0 else None,
+        # the mean above suffers from anything else that uses the GPU during the run, the median step does not
+        "tokens_per_sec_median": round(total_batch_size / sorted(step_times)[len(step_times) // 2]) if step_times else None,
+        "peak_vram_mib": round(get_max_memory() / 1024 / 1024), "wall_clock_s": round(time.time() - script_t0),
+        "diverged": int(diverged), "git_hash": git_hash,
+        "train_loops": args.train_loops, "model_tag": output_dirname, "run_id": run_id,
+        "data_sha256": data_hasher.hexdigest(), "data_hash_rows": data_hash_rows,
+    }
+    with torch.no_grad():
+        learned_scalars = {"resid_lambdas": orig_model.resid_lambdas.tolist(), "x0_lambdas": orig_model.x0_lambdas.tolist(), "backout_lambda": orig_model.backout_lambda.item()}
+    log_event("final", **row, val_bpb_at_500=val_bpb_at_500, min_val_bpb=min_val_bpb, **learned_scalars)
+    csv_path = os.path.join(args.results_dir, "looped_results.csv")
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    print0(f"Appended results row to {csv_path} (diverged={int(diverged)}), log: {jsonl_path}")
 
 # cleanup
 wandb_run.finish() # wandb run finish
