@@ -98,6 +98,9 @@ if args.layout:
     # the default tag is d{depth}: every arm would overwrite the same directory, and evals that
     # guess the model tag prefer d<number> directories
     assert args.model_tag, "--layout requires an explicit --model-tag"
+    # Without it an arm derives horizon, batch size and weight decay from its own size and still runs
+    # to completion, e.g. an 8-layer arm gets 1872 steps at weight decay 0.377 instead of 2520 at 0.28
+    assert args.ref_layout, "--layout requires --ref-layout (use the arm's own layout for a standalone model)"
 else:
     assert not (args.ref_layout or args.train_loops or args.horizon_frac != 1.0), "--ref-layout, --train-loops and --horizon-frac require --layout"
 train_loops = sorted({int(r) for r in args.train_loops.split(",")}) if args.train_loops else []
@@ -348,7 +351,7 @@ if batch_ratio != 1.0:
 # Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
 weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
 if weight_decay_scaled != args.weight_decay:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for {'layout ' + args.layout if args.layout else f'depth {args.depth}'}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
@@ -469,7 +472,7 @@ def hash_data(inputs, targets):
     # called on receipt of every batch: the dataloader reuses its buffers
     global data_hash_rows
     n = min(len(inputs), DATA_HASH_ROWS - data_hash_rows)
-    if n > 0 and not resuming:
+    if n > 0 and args.arm and not resuming: # the .cpu() is a sync point: keep it off the stock path
         rows = torch.cat([inputs[:n], targets[:n]], dim=1).cpu().numpy() # row by row: (input, target) pairs
         data_hasher.update(rows.tobytes())
         data_hash_rows += n
@@ -489,7 +492,7 @@ study = bool(args.arm) and master_process # log this run as an arm of the study
 if study:
     from nanochat.flash_attention import USE_FA3 as attn_is_fa3
     git = lambda *cmd: subprocess.run(["git", *cmd], capture_output=True, text=True).stdout.strip()
-    git_hash = git("rev-parse", "HEAD") + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
+    git_hash = git("rev-parse", "HEAD") + ("-dirty" if git("status", "--porcelain") else "")
     run_id = f"{output_dirname}_{time.strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(os.path.join(args.results_dir, "logs"), exist_ok=True)
     jsonl_path = os.path.join(args.results_dir, "logs", f"{run_id}.jsonl")
@@ -753,8 +756,15 @@ while True:
         wandb_run.log(log_data)
         log_event("train", **log_data, **grad_norms, num_loops=orig_model.num_loops)
 
-    # A diverged run is a result of the study: record it and stop, do not try to rescue it
-    if not math.isfinite(train_loss_f):
+    # A diverged run is a result of the study: record it and stop, do not try to rescue it.
+    # Study runs only: without --arm the loop trains on through a non-finite loss, as upstream does.
+    loss_is_finite = math.isfinite(train_loss_f)
+    if args.arm and is_ddp_initialized():
+        # the loss is rank-local: all ranks have to leave the loop together
+        any_nonfinite = torch.tensor(float(not loss_is_finite), device=device)
+        dist.all_reduce(any_nonfinite, op=dist.ReduceOp.MAX)
+        loss_is_finite = any_nonfinite.item() == 0
+    if args.arm and not loss_is_finite:
         print0(f"Step {step:05d} | training loss is {train_loss_f}: run diverged, stopping")
         diverged = True
         break
@@ -781,13 +791,13 @@ if val_bpb is not None:
 
 # Looped study: one row per run, appended. Rows of past runs are never edited.
 if study:
-    final_val_bpb = float("nan") if diverged else val_bpb_history.get(step)
+    final_val_bpb = float("nan") if diverged else val_bpb_history.get(step, "not evaluated") # e.g. --eval-every -1
     # the second divergence criterion of the study: the final bpb is above the step-500 value
     steps_from_500 = [it for it in sorted(val_bpb_history) if it >= 500]
     val_bpb_at_500 = val_bpb_history[steps_from_500[0]] if steps_from_500 and steps_from_500[0] < step else None
-    if not diverged and final_val_bpb is not None and val_bpb_at_500 is not None:
+    if not diverged and step in val_bpb_history and val_bpb_at_500 is not None:
         diverged = final_val_bpb > val_bpb_at_500
-    timed_steps = max(step - 1 - 10, 0) # total_training_time skips the first 10 steps
+    timed_steps = len(step_times) # total_training_time skips the first 10 steps
     row = {
         "arm": args.arm, "layout": args.layout or str(args.depth), "seed": args.seed, "lr_mult": args.matrix_lr_mult,
         "horizon_frac": args.horizon_frac, "steps": step, "tokens": total_batch_size * step,
@@ -798,7 +808,7 @@ if study:
         "peak_vram_mib": round(get_max_memory() / 1024 / 1024), "wall_clock_s": round(time.time() - script_t0),
         "diverged": int(diverged), "git_hash": git_hash,
         "train_loops": args.train_loops, "model_tag": output_dirname, "run_id": run_id,
-        "data_sha256": data_hasher.hexdigest(), "data_hash_rows": data_hash_rows,
+        "data_sha256": data_hasher.hexdigest() if data_hash_rows > 0 else None, "data_hash_rows": data_hash_rows,
     }
     with torch.no_grad():
         learned_scalars = {"resid_lambdas": orig_model.resid_lambdas.tolist(), "x0_lambdas": orig_model.x0_lambdas.tolist(), "backout_lambda": orig_model.backout_lambda.item()}

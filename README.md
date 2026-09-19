@@ -107,6 +107,27 @@ See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment
 
 The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
 
+## Looped transformer study (this fork)
+
+This fork adds a controlled, single-GPU comparison of standard and looped (weight-shared depth) transformers, pre-registered in [looped_nanochat_proposal.md](looped_nanochat_proposal.md). The lab notebook, including every deviation from the pinned upstream commit `92d63d4` and every ambiguity found in the spec, is [dev/LOOPED_LOG.md](dev/LOOPED_LOG.md). No results yet.
+
+A layout `P,KxR,C` stores `P + K + C` unique blocks and applies the `K` core blocks `R` times, e.g. `2,4x2,2` has 8 unique and 12 effective layers: the parameters of an 8-layer model at the compute of a 12-layer model. Blocks, per-layer scalars and value embeddings are shared across loop iterations; nothing else about the model changes (same Pre-norm block, same init, no extra injection or normalization), which `tests/test_looped.py` proves by showing a looped model equal to an untied stock model loaded with the same weights. Without `--layout`, everything behaves as upstream.
+
+```
+python -m scripts.base_train --layout 2,4x2,2 --width-depth 12 --ref-layout 12 --window-pattern L \
+    --seed 0 --arm L8 --model-tag looped_L8_demo --core-metric-every 999999 --sample-every -1
+```
+
+- `--layout` / `--width-depth`: the layout, and the depth that sets the width (`model_dim = width_depth * aspect_ratio`). `--layout 12` is a plain 12-layer model. Requires `--model-tag` and `--window-pattern L`.
+- `--ref-layout`: horizon, batch size, LR batch scaling and weight decay come from a model of this layout, so they are identical across arms. `--horizon-frac 0.4` only shortens the run.
+- `--matrix-lr-mult`, `--seed` (parameter init only; data order is fixed and its hash is logged).
+- `--train-loops 1,2,3,4`: sample the loop count per optimizer step. `python -m scripts.base_eval --model-tag <tag> --num-loops R` evaluates at any loop count.
+- `--arm NAME`: log the run to `results/logs/*.jsonl` (config, curves, per-layer residual RMS, core vs non-core grad norms) and append one row to `results/looped_results.csv`. Both are append-only.
+
+Run order: `bash runs/looped_phase0.sh` (does the refactored model reproduce stock? how long is a run?), `bash runs/looped_sweep.sh` and `python -m scripts.looped_select_lr` (matrix LR per arm), `bash runs/looped_main.sh` (7 arms x 3 seeds), `bash runs/looped_loopsweep.sh` (test-time loop scaling). All resumable at the granularity of whole runs, all single GPU. Use `uv sync --frozen`: a plain `uv sync` was seen to re-resolve the lockfile.
+
+Tests: `python -m pytest tests/test_looped.py` (add `-m "not slow"` to skip the ones that run the training script).
+
 ## Running on CPU / MPS
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
