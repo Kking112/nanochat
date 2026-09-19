@@ -159,6 +159,7 @@ def main():
         assert model.config.n_core > 0, f"--num-loops needs a looped model, {args.model_tag} has no core blocks"
         model.set_num_loops(args.num_loops) # Engine sizes its KV cache from this too
     if model.config.n_prelude >= 0:
+        assert args.model_tag is not None, "evaluating a layout model requires an explicit --model-tag"
         # The arms of a study share their step count: key the outputs by model tag and loop count
         # as well, so that arms and loop counts do not overwrite each other
         model_name = f"{args.model_tag} (step {meta['step']}, R={model.num_loops})"
@@ -254,6 +255,8 @@ def main():
             "arm": trained_as.get("arm"), "layout": trained_as.get("layout"), "seed": trained_as.get("seed"),
             "train_loops": trained_as.get("train_loops"), "model_tag": args.model_tag, "step": meta["step"],
             "num_loops": model.num_loops, "effective_layers": len(model.visit_schedule()),
+            # the backout subtraction taps the residual after effective layer E // 2, so it moves with R too
+            "backout_layer": len(model.visit_schedule()) // 2,
             "val_bpb": bpb_results.get("val"), "train_bpb": bpb_results.get("train"),
             "core": core_results["core_metric"] if core_results is not None else None,
             "split_tokens": args.split_tokens, "max_per_task": args.max_per_task,

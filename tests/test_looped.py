@@ -150,6 +150,25 @@ def test_t2_visit_schedule():
     assert len(model.visit_schedule()) == 2 + 4 * 3 + 2
     with pytest.raises(AssertionError):
         GPTConfig(n_layer=8, n_prelude=2, n_core=4, n_coda=1, **TINY)  # 2+4+1 != 8
+    for bad in (0, 2.0, True, torch.tensor(2)): # must stay a plain Python int, torch.compile guards on it
+        with pytest.raises(AssertionError):
+            model.set_num_loops(bad)
+
+
+def test_t1_stock_sliding_windows_unchanged():
+    """The stock path keeps its sliding window tiling (layouts are full context only and reject it)."""
+    sliding = dict(TINY, sequence_len=2048, window_pattern="SSSL")
+    new = build(GPT, GPTConfig(n_layer=6, **sliding))
+    old = build(gpt_stock.GPT, gpt_stock.GPTConfig(n_layer=6, **sliding))
+    assert new.window_sizes == old.window_sizes and len(set(new.window_sizes)) == 2
+    assert new.estimate_flops() == old.estimate_flops()
+    randomize_(new, seed=15)
+    old.load_state_dict(new.state_dict(), strict=True)
+    g = torch.Generator().manual_seed(16)
+    idx = torch.randint(0, TINY["vocab_size"], (1, 1024), generator=g) # longer than the short window (768)
+    torch.testing.assert_close(new(idx), old(idx), atol=1e-5, rtol=0)
+    with pytest.raises(AssertionError):
+        GPT(GPTConfig(**gpt_module.parse_layout("1,2x2,1"), **sliding))
 
 
 # -----------------------------------------------------------------------------
@@ -399,7 +418,7 @@ def run_base_train(tmp_path, tag, *args):
 @pytest.mark.slow
 def test_t8_data_order_is_independent_of_seed(tmp_path):
     """--seed changes the parameter init and nothing else: not the data, not the loop counts."""
-    layout = ["--layout", "1,2x2,1", "--width-depth", "4", "--train-loops", "1,2,3"]
+    layout = ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "4", "--train-loops", "1,2,3"]
     a, events_a, _ = run_base_train(tmp_path, "seed0", *layout, "--seed", "0", "--device-batch-size", "2")
     b, events_b, _ = run_base_train(tmp_path, "seed1", *layout, "--seed", "1", "--device-batch-size", "2")
     # the hash counts rows, not micro-batches, so it may not depend on the device batch size either
@@ -417,9 +436,9 @@ def test_t8_data_order_is_independent_of_seed(tmp_path):
 @needs_data
 @pytest.mark.slow
 @pytest.mark.parametrize("tag,args", [
-    ("plain", ["--layout", "4", "--width-depth", "4"]),
-    ("looped", ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "4"]),
-    ("random_r", ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "4", "--train-loops", "1,2,3"]),
+    ("plain", ["--layout", "4", "--width-depth", "4", "--ref-layout", "6"]),
+    ("looped", ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "6"]),
+    ("random_r", ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "6", "--train-loops", "1,2,3"]),
 ])
 def test_t9_smoke(tmp_path, tag, args):
     row, events, losses = run_base_train(tmp_path, tag, *args, "--seed", "0", "--device-batch-size", "2")
@@ -430,6 +449,13 @@ def test_t9_smoke(tmp_path, tag, args):
     kinds = [e["kind"] for e in events]
     assert kinds[0] == "config" and kinds[-1] == "final" and kinds.count("eval") == 3 and kinds.count("diag") == 3
     config, final = events[0], events[-1]
+    # Everything derived from the model size comes from the reference layout (6 layers), not from
+    # the arm (4 unique layers): the horizon is the reference model's, computed here by hand
+    with torch.device("meta"):
+        ref = GPT(GPTConfig(sequence_len=256, vocab_size=config["model_config"]["vocab_size"], n_layer=6, n_head=2, n_kv_head=2, n_embd=256, window_pattern="L"))
+    ref_counts, own_counts = ref.num_scaling_params(), config["param_counts"]
+    assert config["target_tokens"] == 12 * (ref_counts["transformer_matrices"] + ref_counts["lm_head"])
+    assert config["target_tokens"] != 12 * (own_counts["transformer_matrices"] + own_counts["lm_head"])
     E = config["param_counts"]["effective_layers"]
     assert E == (4 if tag == "plain" else 6)
     assert len(final["resid_lambdas"]) == len(final["x0_lambdas"]) == 4 # per unique layer

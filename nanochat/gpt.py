@@ -367,7 +367,7 @@ class GPT(nn.Module):
         under torch.compile every distinct value compiles its own graph.
         A no-op for models without a core (stock, or plain "N" layouts).
         """
-        assert isinstance(num_loops, int) and num_loops >= 1, f"num_loops must be a positive int, got {num_loops!r}"
+        assert type(num_loops) is int and num_loops >= 1, f"num_loops must be a positive int, got {num_loops!r}"
         self.num_loops = num_loops
 
     def visit_schedule(self, num_loops=None):

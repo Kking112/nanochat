@@ -172,3 +172,45 @@ random-R arm (4 training graphs, compiled before the timed loop).
   decoded token (~ 12/8 layers), KV capacity ~ 8/12.
 - CORE with a small `--max-per-task` (8) crashes in stock `core_eval` on 10-shot tasks (few-shot
   examples are sampled from the truncated set). Not touched; the study uses 500.
+
+### Run scripts, end-to-end check, independent review (same session)
+
+- `runs/looped_common.sh` (arm table, tags `looped_<arm>_lr<mult>_h<frac>_s<seed>`, skip-if-done),
+  `looped_phase0.sh`, `looped_sweep.sh`, `looped_main.sh`, `looped_loopsweep.sh`,
+  `scripts/looped_select_lr.py` (refuses to write a selection while an arm's optimum is on a grid
+  edge and prints the command that extends the grid; a diverged run loses but still counts as tried).
+- **End-to-end check of one real sweep cell** through `runs/looped_sweep.sh` (scratch base dir and
+  results dir): B6, 1x, 40% horizon: 1008 steps, 528M tokens, val_bpb 3.171 -> 0.9327, 443k tok/s
+  (mean and median agree), 16.9 GB, 1435 s wall-clock of which ~1190 s training; a second invocation
+  skipped it. So evals and compile cost ~4 min of a sweep run: not negligible next to 40% of the
+  training time, which is why the Phase 0 gate costs training and the rest separately.
+- **Independent review** (separate reviewer agent, read-only): no critical/high findings; it
+  re-derived the weight-sharing equivalence (logit diff 0.0, gradients = sum over visits) and the
+  FLOP parity of B12/L8/L6s/L6p on its own. Fixed from its findings:
+  - `--layout` now REQUIRES `--ref-layout`. Without it an arm silently derives its own recipe and
+    still completes: B8/L8 would get 1872 steps at weight decay 0.377, B6/L6 1548 steps at 0.456,
+    instead of 2520 at 0.28. T9 now checks the horizon is the reference model's and not the arm's.
+  - Stopping at a non-finite loss is now limited to study runs (`--arm`); without it the loop
+    trains on as upstream does. Under DDP the decision is all-reduced so ranks leave together.
+  - The data hash and its GPU sync are limited to study runs; a resumed run records no hash rather
+    than the hash of nothing.
+  - `git_hash` is marked `-dirty` for untracked files too, so a run launched from uncommitted
+    scripts can not carry a clean hash.
+  - `looped_loopsweep.sh` skips models without a checkpoint (a diverged run stops before its final
+    checkpoint) instead of aborting the whole sweep. The run scripts only create the environment
+    when `.venv` is missing, so starting one never touches the `.venv` of a run in progress.
+  - A results row of a run without a final eval says `not evaluated`; throughput of a diverged
+    run counts its last step; `set_num_loops` rejects bools; new test that the stock sliding-window
+    (`SSSL`) path still equals the frozen stock model.
+- **For the write-up (no code change, mandated by spec 9.3):** the backout tap is the residual after
+  effective layer `E // 2`, so in the test-time loop sweep (H4) it moves with R (e = 4, 6, 8, 10, 12,
+  14, 18 for R = 1..6, 8 on `2,4xR,2`), and for the LR arm it moves from step to step in training.
+  The H4 curve therefore varies the backout point together with the loop count. The loop-sweep CSV
+  records `backout_layer`. The main matrix is unaffected (E // 2 = 6 for every 12-effective-layer arm).
+- Full suite: 69 passed, 10 skipped (FA3-only).
+
+### Left for the author
+
+1. `bash runs/looped_phase0.sh` (two full d12 runs, ~1.5 h each, plus the L8 throughput run), record
+   its gate report here, then `git tag prereg-v1` if the gates and all tests pass (spec 9.9).
+2. Before optional Phase 3: `scripts/chat_sft.py` drops the layout keys from `model_config`.
