@@ -11,3 +11,7 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# Looped-transformer study: third-party paper PDF and agent tooling state
+DeepLoop_Paper.pdf
+.omc/
