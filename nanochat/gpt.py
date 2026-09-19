@@ -394,9 +394,11 @@ class GPT(nn.Module):
     def window_sizes(self):
         return self.get_window_sizes()
 
-    def estimate_flops(self):
+    def estimate_flops(self, num_loops=None):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
+        For looped layouts this is for loop count num_loops (default: the current one): a shared
+        block costs its matmuls on every visit, and attention is paid at every effective layer.
         Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
         Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
         On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
@@ -409,21 +411,27 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for window_size in self.get_window_sizes(num_loops):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        num_flops_per_token = 6 * self.num_matmul_params(num_loops) + attn_flops
         return num_flops_per_token
 
-    def num_matmul_params(self):
+    def num_matmul_params(self, num_loops=None):
         """
         The number of parameters that participate in matmuls with the token stream,
         i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
         matmul in this model goes through the Linear class, while non-matmul params
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
+        This is a compute count, not a storage count: a block's matmuls (incl. its ve_gate) are
+        counted once per *visit*, so a looped model counts its core blocks num_loops times.
+        Without looping every block is visited once and this is just the sum over all Linears.
         """
-        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        count = lambda module: sum(m.weight.numel() for m in module.modules() if isinstance(m, Linear))
+        block_params = [count(block) for block in self.transformer.h]
+        non_block_params = count(self) - sum(block_params) # lm_head, smear_gate
+        matmul_params = non_block_params + sum(block_params[u] for u in self.visit_schedule(num_loops))
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
@@ -450,10 +458,11 @@ class GPT(nn.Module):
         return prefill_flops
 
     def kv_bytes_per_token(self):
-        """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
+        """Bytes to *store* one token of KV cache during inference, per row (all layers).
+        There is one cache slot per *effective* layer: a looped block caches K/V on every visit."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
-        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
+        return len(self.visit_schedule()) * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
         """Bytes of KV cache *read* by one decode step at a given context length, per row.
@@ -485,6 +494,9 @@ class GPT(nn.Module):
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        # All of the above are *unique* (stored) parameter counts. Weight sharing changes the
+        # compute (see num_matmul_params), not these. Note that value_embeds scale with the number
+        # of unique layers that carry one, so they must be reported separately from the blocks.
         return {
             'wte': wte,
             'value_embeds': value_embeds,
@@ -492,6 +504,8 @@ class GPT(nn.Module):
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
             'total': total,
+            'unique_layers': self.config.n_layer,
+            'effective_layers': len(self.visit_schedule()),
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):

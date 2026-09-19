@@ -25,6 +25,10 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Checkpoints from before looped layouts existed: stock behavior, every block applied once
+    for key, default in (("n_prelude", -1), ("n_core", 0), ("n_coda", 0), ("n_loop", 1)):
+        if key not in model_config_kwargs:
+            model_config_kwargs[key] = default
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

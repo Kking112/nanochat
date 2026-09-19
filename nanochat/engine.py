@@ -172,6 +172,17 @@ class Engine:
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
 
+    def num_cache_layers(self):
+        """
+        Number of KV cache slots: one per *effective* layer. A looped model visits its core blocks
+        several times with different inputs, so every visit caches its own K/V. The loop count is
+        model state (model.set_num_loops), read here at generation time.
+        Models that know nothing about layouts apply each of their n_layer blocks once.
+        """
+        if hasattr(self.model, "visit_schedule"):
+            return len(self.model.visit_schedule())
+        return self.model.config.n_layer
+
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Same as generate, but does single prefill and then clones the KV cache."""
@@ -193,7 +204,7 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": self.num_cache_layers()}
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
