@@ -214,3 +214,72 @@ random-R arm (4 training graphs, compiled before the timed loop).
 1. `bash runs/looped_phase0.sh` (two full d12 runs, ~1.5 h each, plus the L8 throughput run), record
    its gate report here, then `git tag prereg-v1` if the gates and all tests pass (spec 9.9).
 2. Before optional Phase 3: `scripts/chat_sft.py` drops the layout keys from `model_config`.
+
+---
+
+## 2026-09-20: Phase 0 results. Both gates PASS
+
+`bash runs/looped_phase0.sh`, run by the author 2026-09-19 21:36 to 2026-09-20 00:59 at commit
+`95dc84e`. Raw outputs are committed under `results/` (`looped_results.csv`, `logs/*.jsonl`,
+`stdout/*.log`, `phase0_identity_20260919_213652/`). All runs: SDPA, bf16, seed 0, device batch 32,
+data hash `a1413887432d...` (identical in all three rows), 0 diverged.
+
+### Identity check under torch.compile (20 steps)
+
+Stock `--depth 12` vs refactored `--layout 12`: loss at step 0 identical (difference 0.0), worst
+difference over the 20 steps 1.3e-4 (tolerance 1e-3). PASS. This is the size of this GPU's
+run-to-run drift (see the 2026-09-19 entry), not a difference between the models.
+
+### Full d12 runs (2520 steps, 1,321,205,760 tokens, 1.172e18 training FLOPs)
+
+| run | final val_bpb | min val_bpb | val_bpb @500 | CORE | tok/s mean / median | peak VRAM | wall-clock |
+|---|---|---|---|---|---|---|---|
+| stock `--depth 12` (`stock12`) | 0.847663 | 0.847663 | 1.005543 | 0.1543 | 260,395 / 260,550 | 28,771 MiB | 5835 s (1.62 h) |
+| refactored `--layout 12` (`B12_phase0`) | 0.847749 | 0.847749 | 1.005739 | 0.1494 | 260,521 / 260,701 | 28,771 MiB | 5831 s (1.62 h) |
+
+- **GATE 1: |val_bpb difference| = 0.000086 < 0.003. PASS** (35x inside the gate).
+- The val_bpb curves track each other at every one of the 12 evals; the largest gap is 7.2e-4 at
+  step 250, shrinking to 1e-4 by step 2500. Learned scalars agree too: `backout_lambda` 0.348 vs
+  0.344, `resid_lambdas` within 0.007 everywhere, final residual RMS per layer within 0.2.
+- Throughput and VRAM are the same: the refactor costs nothing.
+
+### L8 throughput (`2,4x2,2`, 200 steps, no eval)
+
+261,757 tok/s mean / 261,012 median, 28,194 MiB peak. Same as B12, as equal FLOPs per token
+(8.871e8) predict. Weight sharing is free in wall-clock at this scale; it saves ~0.6 GB.
+
+### GATE 2: Phase 1 compute
+
+A B12 run = 5831 s = 1.408 h training (tokens / median tok/s) + 0.212 h compile, 12 val evals and
+CORE. A 40%-horizon sweep run = 0.4 x 1.408 + 0.5 x 0.212 = 0.669 h. Phase 1 = 21 main runs + 21
+sweep runs = 21 x (1.620 + 0.669) h = **2.0 GPU-days <= 10. PASS.** (Proposal 3.6 guessed ~5.)
+Costing every arm like B12 is on the safe side: B8/B6 are much cheaper, only the LR arm is dearer
+(~1.17x). Not included: `runs/looped_loopsweep.sh` (42 evaluations). No arm needs to be dropped.
+
+### What these two runs say about noise (useful for reading Phase 1)
+
+`stock12` and `B12_phase0` are the same model, same seed, same data, and differ only by this GPU's
+nondeterminism. So this pair is a direct measurement of the noise floor *below* seed variance:
+
+- final val_bpb: 8.6e-5. Any Phase 1 difference has to be read against seed SD, which can not be
+  smaller than this.
+- **CORE: 0.0049** (0.1543 vs 0.1494) between two runs that agree to 1e-4 in val_bpb. At this scale
+  CORE differences below ~0.005 are not distinguishable from rerunning the same model. This supports
+  the pre-registered choice of val_bpb as primary and CORE/H5 as descriptive only.
+
+### Correction to the provenance of these rows
+
+All three rows carry `git_hash = 95dc84e...-dirty`. No code was modified: tracked files are
+byte-identical to `95dc84e` (`git diff --quiet HEAD -- nanochat scripts runs tests pyproject.toml
+uv.lock`). The `-dirty` is a flaw in the 2026-09-19 review fix that made the dirty check count
+untracked files repo-wide: the untracked `results/` directory that the first run creates (and an
+unrelated untracked `.agents/`) then marks every later run dirty. The rows are left as written
+(append-only). Fixed for future runs: the check now covers the code and its environment only
+(`nanochat scripts runs tasks tests pyproject.toml uv.lock`), still including untracked files there.
+Limit of this statement: it is established now, after the runs, not recorded at run time.
+
+### Definition of done for Phase 0 (spec 9.9)
+
+All tests pass (69 passed, 10 skipped FA3-only, rerun today); both gates met; tokens/s for B12 and
+L8 and the revised compute estimate are recorded above. Remaining: the author places
+`git tag prereg-v1` on the commit that contains the proposal and the passing tests.

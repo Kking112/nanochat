@@ -1,0 +1,88 @@
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+Autodetected device type: cuda
+2026-09-19 21:37:36,807 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+2026-09-19 21:37:36,808 - nanochat.common - [33m[1mWARNING[0m - Peak flops undefined for: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, MFU will show as 0%
+GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition | Peak FLOPS (BF16): inf
+COMPUTE_DTYPE: torch.bfloat16 (auto-detected: CUDA SM 120 (bf16 supported))
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback
+WARNING: Training will be less efficient without FA3
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Vocab size: 32,768
+Model config:
+{
+  "sequence_len": 2048,
+  "vocab_size": 32768,
+  "n_layer": 12,
+  "n_head": 6,
+  "n_kv_head": 6,
+  "n_embd": 768,
+  "window_pattern": "L",
+  "n_prelude": 12,
+  "n_core": 0,
+  "n_coda": 0,
+  "n_loop": 1
+}
+Parameter counts:
+wte                     : 25,165,824
+value_embeds            : 150,994,944
+lm_head                 : 25,165,824
+transformer_matrices    : 84,935,088
+scalars                 : 50
+total                   : 286,261,730
+unique_layers           : 12
+effective_layers        : 12
+Estimated FLOPs per token: 8.870980e+08
+Horizon and derived hyperparameters use reference layout 12: 110,100,912 scaling params (this model: 110,100,912)
+Auto-computed optimal batch size: 524,288 tokens
+Scaling the LR for the AdamW parameters ∝1/√(768/768) = 1.000000
+Using user-provided number of iterations: 20
+Total number of training tokens: 10,485,760
+Tokens : Scaling params ratio: 0.10
+Total training FLOPs estimate: 9.301897e+15
+Parameter table:
+  unique block params                     : 84,935,088
+  lm_head                                 : 25,165,824
+  wte                                     : 25,165,824
+  value embed params (lookups, no FLOPs)  : 150,994,944
+  scalars                                 : 50
+  unique layers U                         : 12
+  effective layers E                      : 12
+  FLOPs per token                         : 887,098,032
+Tokens / micro-batch / rank: 32 x 2048 = 65,536
+Tokens / micro-batch: 65,536
+Total batch size 524,288 => gradient accumulation steps: 8
+step 00000/00020 (0.00%) | loss: 10.397021 | lrm: 0.03 | dt: 3419.03ms | tok/sec: 153,344 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 1 | total time: 0.00m
+step 00001/00020 (5.00%) | loss: 10.384684 | lrm: 0.05 | dt: 1904.55ms | tok/sec: 275,281 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 2 | total time: 0.00m
+step 00002/00020 (10.00%) | loss: 10.362551 | lrm: 0.07 | dt: 1917.40ms | tok/sec: 273,437 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 3 | total time: 0.00m
+step 00003/00020 (15.00%) | loss: 10.328478 | lrm: 0.10 | dt: 1919.72ms | tok/sec: 273,106 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 4 | total time: 0.00m
+step 00004/00020 (20.00%) | loss: 10.278533 | lrm: 0.12 | dt: 1920.72ms | tok/sec: 272,964 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 5 | total time: 0.00m
+step 00005/00020 (25.00%) | loss: 10.199241 | lrm: 0.15 | dt: 1922.38ms | tok/sec: 272,728 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 6 | total time: 0.00m
+step 00006/00020 (30.00%) | loss: 10.073731 | lrm: 0.17 | dt: 1929.71ms | tok/sec: 271,692 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 7 | total time: 0.00m
+step 00007/00020 (35.00%) | loss: 9.854392 | lrm: 0.20 | dt: 1965.89ms | tok/sec: 266,692 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 8 | total time: 0.00m
+step 00008/00020 (40.00%) | loss: 9.553443 | lrm: 0.23 | dt: 1930.89ms | tok/sec: 271,526 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 10 | total time: 0.00m
+step 00009/00020 (45.00%) | loss: 9.280166 | lrm: 0.25 | dt: 1934.93ms | tok/sec: 270,959 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 11 | total time: 0.00m
+step 00010/00020 (50.00%) | loss: 8.992874 | lrm: 0.28 | dt: 1947.05ms | tok/sec: 269,273 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 12 | total time: 0.00m
+step 00011/00020 (55.00%) | loss: 8.724196 | lrm: 0.30 | dt: 1939.31ms | tok/sec: 270,348 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 13 | total time: 0.03m | eta: 0.3m
+step 00012/00020 (60.00%) | loss: 8.496944 | lrm: 0.33 | dt: 1943.20ms | tok/sec: 269,807 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 14 | total time: 0.06m | eta: 0.3m
+step 00013/00020 (65.00%) | loss: 8.280663 | lrm: 0.35 | dt: 1946.35ms | tok/sec: 269,369 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 15 | total time: 0.10m | eta: 0.2m
+step 00014/00020 (70.00%) | loss: 8.084483 | lrm: 0.38 | dt: 1948.41ms | tok/sec: 269,085 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 16 | total time: 0.13m | eta: 0.2m
+step 00015/00020 (75.00%) | loss: 7.893068 | lrm: 0.40 | dt: 1950.28ms | tok/sec: 268,827 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 17 | total time: 0.16m | eta: 0.2m
+step 00016/00020 (80.00%) | loss: 7.711513 | lrm: 0.42 | dt: 1952.50ms | tok/sec: 268,521 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 18 | total time: 0.19m | eta: 0.1m
+step 00017/00020 (85.00%) | loss: 7.554179 | lrm: 0.45 | dt: 1954.67ms | tok/sec: 268,223 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 19 | total time: 0.23m | eta: 0.1m
+step 00018/00020 (90.00%) | loss: 7.410327 | lrm: 0.47 | dt: 1957.40ms | tok/sec: 267,848 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 20 | total time: 0.26m | eta: 0.1m
+step 00019/00020 (95.00%) | loss: 7.281316 | lrm: 0.50 | dt: 1959.77ms | tok/sec: 267,525 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 21 | total time: 0.29m | eta: 0.0m
+2026-09-19 21:38:18,417 - nanochat.checkpoint_manager - [32m[1mINFO[0m - Saved model parameters to: /home/neo/.cache/nanochat/base_checkpoints/looped_phase0_check_B12/model_000020.pt
+2026-09-19 21:38:18,417 - nanochat.checkpoint_manager - [32m[1mINFO[0m - Saved metadata to: /home/neo/.cache/nanochat/base_checkpoints/looped_phase0_check_B12/meta_000020.json
+Peak memory usage: 28774.39MiB
+Total training time: 0.29m
+Appended results row to results/phase0_identity_20260919_213652/looped_results.csv (diverged=0), log: results/phase0_identity_20260919_213652/logs/looped_phase0_check_B12_20260919_213737.jsonl
