@@ -43,7 +43,7 @@ behavior change. Protected implementation files are untouched.
 | M2 | complete | 40 offline task tests; integrated suite 190 passed, 10 skipped |
 | M3 | complete (smoke) | 50 steps, downward finite loss, reload and 18 closed think samples |
 | M4 | GPU smoke deferred | Runtime/RL implemented; CPU integration verified |
-| M5 | pending | CLI, evaluator, runner and documentation |
+| M5 | complete | Evaluator, streamed CLI, guarded runner, docs and CPU acceptance |
 | M6 | budget approval pending | No experimental improvement claim |
 
 ## M1 — format and reward verification
@@ -235,20 +235,20 @@ OMP_NUM_THREADS=1 uv run --no-sync python -u -m scripts.reason_sft \
   --eval-tokens 8192 --chatcore-every -1 --no-compile
 ```
 
-- Input: original `sft/d24` step486; output `reason_sft/d24-reason-smoke-20260919`
-  step50, separate model/optimizer/metadata files outside Git.
-- Filtered mixture: 11,255 train rows, 192 validation rows; sequence length2048.
-- First five raw losses mean .552706; last five mean .435255. All50 finite.
+- Input: original `sft/d24` step 486; output `reason_sft/d24-reason-smoke-20260919`
+  step 50, separate model/optimizer/metadata files outside Git.
+- Filtered mixture: 11,255 train rows, 192 validation rows; sequence length 2048.
+- First five raw losses mean .552706; last five mean .435255. All 50 finite.
 - Validation BPB .344775 on the new reasoning validation mixture; it cannot be
   compared directly to the original SFT checkpoint's historical .272163.
-- Training69.918 seconds; median warmed step1.322 seconds,12,396 packed tokens/s;
-  peak allocated VRAM23,794,256,384 bytes (22.16GiB). Data preparation, downloads,
+- Training 69.918 seconds; median warmed step 1.322 seconds, 12,396 packed tokens/s;
+  peak allocated VRAM 23,794,256,384 bytes (22.16 GiB). Data preparation, downloads,
   initial model load and checkpoint write are outside the training-loop timer.
 - Original smoke log `/tmp/reasoning-sft-smoke.log`; durable training metrics and
   metadata are in the output checkpoint directory.
 - SFT CPU tests cover fixed iteration counts, full-epoch stopping, fresh optimizer,
   checkpoint context, tool masking and finite/nonnegative learning rates. Review
-  fixed inherited prefetch stopping so tiny datasets cannot checkpoint step0.
+  fixed inherited prefetch stopping so tiny datasets cannot checkpoint step 0.
   Progress display now accounts for gradient accumulation.
 
 Completion/reload check on 2026-09-20:
@@ -261,8 +261,8 @@ OMP_NUM_THREADS=1 uv run --no-sync python -u -m scripts.reason_eval \
 ```
 
 Canceled to prioritize the user's other training after two complete prompts.
-The saved18 completions (two greedy plus16 sampled) all contain valid closed
-think blocks and have binary correctness0. This passes the format smoke gate,
+The saved 18 completions (two greedy plus 16 sampled) all contain valid closed
+think blocks and have binary correctness 0. This passes the format smoke gate,
 not a correctness improvement test. Partial raw JSONL is retained; no final
 summary was written. The chained ChatCORE comparison never started. Do not treat
 this interrupted run as a completed evaluation or use its contended timing as
@@ -271,18 +271,18 @@ remain pending; no campaign budget estimate is asserted without those measuremen
 
 SFT smoke executed from the implementation working tree atop `54910a5`; source
 was committed afterward. Subsequent SFT changes corrected progress display and
-style, without changing the explicit50-step loss/optimizer schedule. Runtime and
+style, without changing the explicit 50-step loss/optimizer schedule. Runtime and
 evaluation implementation commit: `dee1203`. The SFT commit gate rerun with CUDA
-hidden passed **189 tests,14 skipped** in4.43s; all new Python files and modified
+hidden passed **189 tests, 14 skipped** in 4.43s; all new Python files and modified
 CLI/evaluator files pass scoped Ruff. The six protected baseline files compare
 byte-identical to `ac2aecf`.
 
-### Length sample (CPU-only,2026-09-20)
+### Length sample (CPU-only, 2026-09-20)
 
 `CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 nice -n 10 uv run --no-sync
-/tmp/reasoning_lengths.py` inspected the first1000 physical rows of each first
-downloaded shard and1000 generated examples per procedural task (seed42,
-difficulty1). This is a schema/length sanity sample, not the full training mixture.
+/tmp/reasoning_lengths.py` inspected the first 1000 physical rows of each first
+downloaded shard and 1000 generated examples per procedural task (seed 42,
+difficulty 1). This is a schema/length sanity sample, not the full training mixture.
 All counts use untruncated rendering with the actual cached tokenizer.
 
 | Source | Converted | Retained at both limits | ≤256 | 257–512 | 513–768 | 769–1024 | 1025–1536 | >1536 |
@@ -294,7 +294,42 @@ All counts use untruncated rendering with the actual cached tokenizer.
 | Sorting |1000|1000|1000|0|0|0|0|0|
 | Countdown |1000|1000|1000|0|0|0|0|0|
 
-Maximum full lengths: GSM517, MetaMath2034, OpenMath1544, chains87, sorting93,
-Countdown100. Assistant limits reject additional traces even when total length
+Maximum full lengths: GSM 517, MetaMath 2034, OpenMath 1544, chains 87, sorting 93,
+Countdown 100. Assistant limits reject additional traces even when total length
 fits. Raw histogram JSON: `/tmp/reasoning-lengths.json` (copied to durable external
 smoke evidence before handoff).
+
+## M5 — CLI, runner, final offline verification
+
+SFT implementation commit `019ab4d`, tagged `reasoning-m3`. Added source-aware
+CLI budgets, dimmed streaming think text with all delimiter split positions
+covered, unchanged plain redirected text, and the preserved 512-token existing
+`run_chat_eval` API default. The runner chains explicit input checkpoint → SFT
+→ binary evaluation → RL → evaluation/ChatCORE, using uv and fresh output tags.
+It wraps GPU subprocesses with the 80% total-device VRAM guard. README, repository
+guidance and provisional results explicitly describe the pending GPU and campaign
+gates. No `reasoning-m4` or `reasoning-m6` tag is warranted yet.
+
+Final required suite with CUDA hidden: **190 passed, 14 skipped**, 4.47 s
+(`/tmp/reasoning-m5-tests.log`; use the log's measured duration if rerun).
+Scoped Ruff passed for all newly added Python files and the modified CLI/evaluator;
+`bash -n runs/reasoning_singlegpu.sh` passed. Existing checkpoint-manager lint
+warnings predate this work and were not included in scoped clean-code claims.
+Protected-file comparison against `ac2aecf` is empty. The monitor's actual
+`nvidia-smi` parsing returned total-device usage .3522 without launching a GPU
+process. Only the user's preexisting training and desktop compute process remained.
+
+Next GPU command, once the priority training is finished (fresh output tag):
+
+```bash
+OMP_NUM_THREADS=1 uv run --no-sync python -m scripts.reason_gpu_guard -- \
+  uv run --no-sync python -m scripts.reason_rl \
+  --source reason_sft --model-tag d24-reason-smoke-20260919 --model-step 50 \
+  --output-tag d24-reason-rl-smoke --num-steps 5 \
+  --examples-per-step 4 --num-samples 8 --device-batch-size 2
+```
+
+Then reload/evaluate that checkpoint with identical budgets, finish the matched
+ChatCORE comparison, measure isolated RL/evaluation costs, and present the full
+campaign budget decision. Full A/B/C/D runs and the 20-completion D-arm exploitation
+audit remain unrun; `REASONING_RESULTS.md` records that explicitly.

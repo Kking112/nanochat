@@ -1087,3 +1087,14 @@ Muon was changed to use Polar Express, added NorMuon variance reduction, and cau
 **Observation:** modded-nanogpt does not appear to clip either right now.
 
 **Summary:** Deleted all grad-clip code paths. The code naturally produces well-behaved gradients. This improves a bit of MFU because we don't have to calculate and sync grad norms.
+## 2026-09-20 — Optional reasoning stages
+
+Added reasoning SFT/RL, correctness-separated shaped rewards, inspected numeric
+dataset adapters, held-out procedural tasks, uncropped data filtering, binary
+evaluation, streamed CLI styling and a single-GPU runner with an 80% total-VRAM
+guard. Existing model/tokenizer/engine and original training stages remain
+unchanged. The d24 step-486 parent passed a 50-iteration reasoning SFT smoke;
+RL GPU smoke and full experiments are deferred for the owner's priority LLM
+training and subsequent campaign budget decision. No correctness improvement
+is claimed. See `REASONING_LOG.md`, `REASONING_DESIGN.md` and
+`REASONING_RESULTS.md` for commands, evidence and remaining gates.
