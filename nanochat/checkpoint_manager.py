@@ -20,6 +20,8 @@ CHECKPOINT_SOURCES: dict[str, str] = {
     "base": "base_checkpoints",
     "sft": "chatsft_checkpoints",
     "rl": "chatrl_checkpoints",
+    "reason_sft": "reasonsft_checkpoints",
+    "reason_rl": "reasonrl_checkpoints",
 }
 
 def log0(message):

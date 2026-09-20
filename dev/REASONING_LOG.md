@@ -41,8 +41,8 @@ behavior change. Protected implementation files are untouched.
 | M0 | complete | 48 passed, 10 skipped; fresh bounded five-task baseline above |
 | M1 | complete | 73 focused tests; 124 passed, 10 skipped in integrated suite |
 | M2 | complete | 40 offline task tests; integrated suite 190 passed, 10 skipped |
-| M3 | pending | SFT implementation and 50-step smoke |
-| M4 | in progress | Generation adapter, RL implementation and fixture tests |
+| M3 | complete (smoke) | 50 steps, downward finite loss, reload and 18 closed think samples |
+| M4 | GPU smoke deferred | Runtime/RL implemented; CPU integration verified |
 | M5 | pending | CLI, evaluator, runner and documentation |
 | M6 | budget approval pending | No experimental improvement claim |
 
@@ -191,3 +191,80 @@ actual locally trained fixture tokenizers; no dataset download is used by tests.
 
 M1 lint follow-up: imports normalized and frozen reward defaults shared through a
 module-level constant; behavior remains covered by the integrated 190-test pass.
+
+## 2026-09-20 — runtime verification and GPU priority
+
+M1 lint follow-up commit: `7472215`; M2 commit: `2c325ad`.
+Implemented the new checkpoint source entries, generation adapter retaining true
+terminal targets/tool masks, mean-only RL with exact group-token normalization,
+partial microbatches, constant-reward skip, collective inactive-rank handling,
+synchronized checkpointed curriculum, configurable rewards and JSONL diagnostics.
+The evaluator independently samples greedy and pass@8 responses, stores raw
+completions/provenance and reports binary task metrics, Wilson intervals, lengths,
+termination and timing. No reward score is reported as evaluation accuracy.
+
+Runtime tests include a full tiny CPU RL loop with real gradients, two optimizer
+updates, partial sample batches, checkpoint round trips and component logs.
+`uv run --no-sync python -m pytest -m "not slow"`: **190 passed, 10 skipped**,
+7.20 s immediately before M2 commit. After the user's GPU-priority instruction,
+`CUDA_VISIBLE_DEVICES='' uv run --no-sync python -m pytest -m "not slow"`:
+**189 passed, 14 skipped**, 4.43 s (includes three new resource-guard tests).
+Scoped lint passes for all new runtime files. Multi-GPU behavior is not empirically
+validated; collective paths have local fixture coverage only.
+
+The user is running other LLM training and explicitly gives it priority. This
+project's evaluation PID 3272133 was terminated with SIGTERM on 2026-09-20;
+the other training PID 3256736 was not signaled or modified. Observed total VRAM
+before cancellation: 44,758 / 97,887 MiB (45.7%). Cancellation was proactive to
+prioritize the other workload, not an out-of-memory failure. This project's GPU
+work is deferred while that training is active. The runner's resource guard
+polls total-device VRAM and terminates only its own new process group above 80%;
+it also cancels its child if monitoring fails. Guard behavior is CPU-fixture tested.
+
+## M3 — 50-iteration SFT smoke
+
+Command (2026-09-19; protected baseline files unchanged):
+
+```bash
+OMP_NUM_THREADS=1 uv run --no-sync python -u -m scripts.reason_sft \
+  --source sft --model-tag d24 --model-step 486 \
+  --output-tag d24-reason-smoke-20260919 --num-iterations 50 \
+  --device-batch-size 2 --total-batch-size 16384 \
+  --metamath-rows 256 --omi2-rows 256 --gsm8k-epochs 1 \
+  --procedural-rows 512 --replay-frac 0.25 --validation-size 32 \
+  --eval-tokens 8192 --chatcore-every -1 --no-compile
+```
+
+- Input: original `sft/d24` step486; output `reason_sft/d24-reason-smoke-20260919`
+  step50, separate model/optimizer/metadata files outside Git.
+- Filtered mixture: 11,255 train rows, 192 validation rows; sequence length2048.
+- First five raw losses mean .552706; last five mean .435255. All50 finite.
+- Validation BPB .344775 on the new reasoning validation mixture; it cannot be
+  compared directly to the original SFT checkpoint's historical .272163.
+- Training69.918 seconds; median warmed step1.322 seconds,12,396 packed tokens/s;
+  peak allocated VRAM23,794,256,384 bytes (22.16GiB). Data preparation, downloads,
+  initial model load and checkpoint write are outside the training-loop timer.
+- Original smoke log `/tmp/reasoning-sft-smoke.log`; durable training metrics and
+  metadata are in the output checkpoint directory.
+- SFT CPU tests cover fixed iteration counts, full-epoch stopping, fresh optimizer,
+  checkpoint context, tool masking and finite/nonnegative learning rates. Review
+  fixed inherited prefetch stopping so tiny datasets cannot checkpoint step0.
+  Progress display now accounts for gradient accumulation.
+
+Completion/reload check on 2026-09-20:
+
+```bash
+OMP_NUM_THREADS=1 uv run --no-sync python -u -m scripts.reason_eval \
+  --source reason_sft --model-tag d24-reason-smoke-20260919 --model-step 50 \
+  --tasks gsm8k --max-examples 4 --max-new-tokens 1024 --device-batch-size 2 \
+  --output-dir /home/neo/.cache/nanochat/reasoning_runs/d24-reason-smoke-gsm4
+```
+
+Canceled to prioritize the user's other training after two complete prompts.
+The saved18 completions (two greedy plus16 sampled) all contain valid closed
+think blocks and have binary correctness0. This passes the format smoke gate,
+not a correctness improvement test. Partial raw JSONL is retained; no final
+summary was written. The chained ChatCORE comparison never started. Do not treat
+this interrupted run as a completed evaluation or use its contended timing as
+an isolated-GPU throughput measurement. Five-step RL GPU smoke and full campaign
+remain pending; no campaign budget estimate is asserted without those measurements.
