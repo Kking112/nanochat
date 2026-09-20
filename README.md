@@ -126,6 +126,8 @@ python -m scripts.base_train --layout 2,4x2,2 --width-depth 12 --ref-layout 12 -
 
 Run order: `bash runs/looped_phase0.sh` (does the refactored model reproduce stock? how long is a run?), `bash runs/looped_sweep.sh` and `python -m scripts.looped_select_lr` (matrix LR per arm), `bash runs/looped_main.sh` (7 arms x 3 seeds), `bash runs/looped_loopsweep.sh` (test-time loop scaling). All resumable at the granularity of whole runs, all single GPU. Use `uv sync --frozen`: a plain `uv sync` was seen to re-resolve the lockfile.
 
+Analysis: `python -m scripts.looped_analyze` writes `results/analysis.md` (results table, the pre-registered decisions on H1-H4, the recovery fraction) and `results/figures/F1..F6`. Its decision rule was written, and is tested on synthetic data (`tests/test_looped_analyze.py`), before any main-matrix run existed.
+
 Tests: `python -m pytest tests/test_looped.py` (add `-m "not slow"` to skip the ones that run the training script).
 
 ## Running on CPU / MPS
