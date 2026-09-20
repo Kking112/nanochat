@@ -1,12 +1,12 @@
 """Shared reasoning syntax and deterministic, Torch-independent parsing helpers."""
 
+import math
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
-import math
-import re
-from typing import Callable, TypedDict
-
+from typing import TypedDict
 
 THINK_START = "<think>"
 THINK_END = "</think>"
@@ -34,7 +34,7 @@ _TAG_RE = re.compile(r"<\s*/?\s*think\b[^>]*(?:>|$)", re.IGNORECASE)
 _MARKER_RE = re.compile(r"^[ \t]*####[ \t]+([^\r\n]+)", re.MULTILINE)
 
 
-def normalize_numeric(value: str | int | float | Decimal | Fraction) -> str | None:
+def normalize_numeric(value: str | float | Decimal | Fraction) -> str | None:
     """Return an exact canonical rational; currency/grouping are presentation only.
 
     Fractions avoid decimal rounding and make ``0.5`` and ``1/2`` identical.

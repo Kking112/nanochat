@@ -1,6 +1,7 @@
 """Pure CPU format, arithmetic boundary and exact normalization acceptance tests."""
 
 from fractions import Fraction
+
 import pytest
 
 from nanochat.reasoning import (

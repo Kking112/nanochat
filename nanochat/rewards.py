@@ -1,10 +1,17 @@
 """Separated correctness-band rewards; training diagnostics, never evaluation metrics."""
 
-from dataclasses import asdict, dataclass
 import math
-from typing import Any, Literal, Mapping, Protocol
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from typing import Any, Literal, Protocol
 
-from nanochat.reasoning import Calculator, normalize_numeric, parse_reasoning, repeated_ngram_fraction, verify_arithmetic
+from nanochat.reasoning import (
+    Calculator,
+    normalize_numeric,
+    parse_reasoning,
+    repeated_ngram_fraction,
+    verify_arithmetic,
+)
 
 
 class RewardTask(Protocol):
@@ -69,6 +76,9 @@ class RewardConfig:
         )
 
 
+DEFAULT_REWARD_CONFIG = RewardConfig()
+
+
 def clip01(value: float) -> float:
     return min(1.0, max(0.0, value))
 
@@ -86,7 +96,7 @@ def combine_reward(
     r_answer_partial: float,
     r_process: float,
     penalties: float,
-    config: RewardConfig = RewardConfig(),
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
     progress: float = 0.0,
 ) -> BandScores:
     """Clip quality scores only; binary correctness exclusively selects the band."""
@@ -138,7 +148,7 @@ def score_response(
     conversation: Mapping[str, Any],
     response: str,
     calculator: Calculator,
-    config: RewardConfig = RewardConfig(),
+    config: RewardConfig = DEFAULT_REWARD_CONFIG,
     progress: float = 0.0,
     mode: Literal["binary", "shaped"] = "shaped",
     terminated: bool = True,

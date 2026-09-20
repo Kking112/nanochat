@@ -1,8 +1,10 @@
 """Band dominance, process exploits and penalties tested without Torch or datasets."""
 
-from dataclasses import replace
 import random
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import replace
+from typing import Any
+
 import pytest
 
 from nanochat.reasoning import extract_answer_marker, normalize_numeric
@@ -51,7 +53,9 @@ def test_randomized_dominance_including_malformed_correct_responses() -> None:
         progress = rng.random()
         wrong = combine_reward(False, *components, penalty, progress=progress)
         correct = combine_reward(True, *components, penalty, progress=progress)
-        assert 0 <= wrong.total <= 0.5 < 0.7 <= correct.total <= 1
+        assert 0 <= wrong.total <= 0.5
+        assert 0.7 <= correct.total <= 1
+        assert wrong.total < correct.total
     malformed = score_response(NumericTask(), CONVERSATION, "#### 10\nextra", calculator, terminated=False, completion_tokens=768)
     assert malformed.r_format == 0
     assert malformed.total == 0.7
