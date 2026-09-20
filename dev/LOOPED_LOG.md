@@ -283,3 +283,53 @@ Limit of this statement: it is established now, after the runs, not recorded at 
 All tests pass (69 passed, 10 skipped FA3-only, rerun today); both gates met; tokens/s for B12 and
 L8 and the revised compute estimate are recorded above. Remaining: the author places
 `git tag prereg-v1` on the commit that contains the proposal and the passing tests.
+
+---
+
+## 2026-09-20: Phase 1a, matrix LR sweep. Gate PASS, 2x selected for every arm
+
+`bash runs/looped_sweep.sh` (01:07 to 13:40), then the grid extension
+`LR_MULTS="4" bash runs/looped_sweep.sh` (13:41 to 17:55). 28 runs, 16.7 GPU-hours, all at commit
+`55961c2` with a clean hash, all with data hash `a1413887432d...`, 0 diverged. Seed 0, 40% horizon
+(1008 steps, 528M tokens); batch size, LR batch scale and weight decay at their full-horizon values.
+
+Final val_bpb (`*` = selected):
+
+| arm | layout | 0.5x | 1x | 2x | 4x |
+|---|---|---|---|---|---|
+| B12 | `12` | 0.91583 | 0.90148 | 0.89974* | 0.90668 |
+| B8 | `8` | 0.92869 | 0.92087 | 0.91726* | 0.92158 |
+| B6 | `6` | 0.94710 | 0.93285 | 0.93131* | 0.93746 |
+| L8 | `2,4x2,2` | 0.92722 | 0.91010 | 0.90891* | 0.91405 |
+| L6s | `2,2x4,2` | 0.93882 | 0.91943 | 0.91904* | 0.92352 |
+| L6p | `0,6x2,0` | 0.93608 | 0.92238 | 0.91722* | 0.92166 |
+| LR | `2,4xR,2` | 0.92940 | 0.91730 | 0.91586* | 0.92194 |
+
+- After the first grid {0.5, 1, 2} the optimum of EVERY arm was at the upper edge (2x), so by
+  section 3.3 step 2 the grid was extended one step for every arm. 4x is worse than 2x for every
+  arm, so every optimum is now interior. **Gate "no arm has its optimum at a grid edge after
+  extension": PASS.** `results/selected_lr.json`: 2x for all seven arms, written by
+  `scripts.looped_select_lr` (which refused to write anything before the extension).
+- The motivation for the sweep (section 3.3) was that a shared weight sums its gradient over R
+  visits, so stock `matrix_lr` might be mis-tuned for looped arms specifically. At this horizon
+  that is not what the sweep shows: the optimum is the same (2x) for untied and looped arms alike,
+  so no arm gets a different multiplier than its controls, and the main-matrix comparisons are all
+  at one common `matrix_lr` = 0.04. That 2x also wins for the stock B12 is most plausibly a property
+  of the 40% horizon (a shorter run tolerates a higher LR), i.e. the stated limitation of tuning at
+  a reduced horizon, not evidence that stock nanochat is mis-tuned at its full horizon.
+- Caveats for reading the table, all single-seed: the 1x vs 2x gap is small for several arms
+  (L6s 0.0004, L8 0.0012, LR 0.0014, B6 0.0015, B12 0.0017; larger for B8 0.0036 and L6p 0.0052).
+  The same-seed noise floor from Phase 0 is ~1e-4 and the seed SD is not known yet, so for L6s in
+  particular "2x beats 1x" is not established; the pre-registered rule selects by lowest val_bpb
+  regardless and was followed. Descriptively, too low an LR (0.5x vs 1x) costs the looped arms more
+  (L6s +0.019, L8 +0.017, L6p +0.014, LR +0.012) than B8 (+0.008), with B12 and B6 (+0.014) in between.
+- No arm-ordering conclusions are drawn from sweep runs: they are one seed at 40% horizon and are
+  not part of the confirmatory analysis.
+- Throughput (median tok/s, stable across the 4 runs of each arm): B12 ~263k, L8 ~267k, L6s ~268k,
+  L6p ~268k, B8 ~363k, B6 ~449k, LR ~210k (mean E = 14, 42.8 GB peak). A sweep run costs 38-39 min
+  for the E = 12 arms, 44 min for LR.
+
+Next: main matrix, `bash runs/looped_main.sh` (7 arms x seeds 0,1,2 at 2x, full horizon), ~1.6 h
+per E = 12 run, ~1.4 GPU-days in total. `scripts/looped_analyze.py` (decision rule, rho, figures)
+was written and tested on synthetic data on 2026-09-20, before any main-matrix run existed, and is
+merged before the main matrix starts.
