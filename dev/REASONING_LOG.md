@@ -268,3 +268,33 @@ summary was written. The chained ChatCORE comparison never started. Do not treat
 this interrupted run as a completed evaluation or use its contended timing as
 an isolated-GPU throughput measurement. Five-step RL GPU smoke and full campaign
 remain pending; no campaign budget estimate is asserted without those measurements.
+
+SFT smoke executed from the implementation working tree atop `54910a5`; source
+was committed afterward. Subsequent SFT changes corrected progress display and
+style, without changing the explicit50-step loss/optimizer schedule. Runtime and
+evaluation implementation commit: `dee1203`. The SFT commit gate rerun with CUDA
+hidden passed **189 tests,14 skipped** in4.43s; all new Python files and modified
+CLI/evaluator files pass scoped Ruff. The six protected baseline files compare
+byte-identical to `ac2aecf`.
+
+### Length sample (CPU-only,2026-09-20)
+
+`CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 nice -n 10 uv run --no-sync
+/tmp/reasoning_lengths.py` inspected the first1000 physical rows of each first
+downloaded shard and1000 generated examples per procedural task (seed42,
+difficulty1). This is a schema/length sanity sample, not the full training mixture.
+All counts use untruncated rendering with the actual cached tokenizer.
+
+| Source | Converted | Retained at both limits | ≤256 | 257–512 | 513–768 | 769–1024 | 1025–1536 | >1536 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| GSM8K |1000|1000|822|177|1|0|0|0|
+| MetaMathQA |950|948|559|353|30|4|3|1|
+| OpenMathInstruct-2 |572|567|148|246|103|54|20|1|
+| Chains |1000|1000|1000|0|0|0|0|0|
+| Sorting |1000|1000|1000|0|0|0|0|0|
+| Countdown |1000|1000|1000|0|0|0|0|0|
+
+Maximum full lengths: GSM517, MetaMath2034, OpenMath1544, chains87, sorting93,
+Countdown100. Assistant limits reject additional traces even when total length
+fits. Raw histogram JSON: `/tmp/reasoning-lengths.json` (copied to durable external
+smoke evidence before handoff).
