@@ -228,3 +228,75 @@ If you find nanochat helpful in your research cite simply as:
 ## License
 
 MIT
+
+## Optional reasoning phase
+
+The optional pipeline starts from an existing chat SFT checkpoint:
+`chat_sft → reason_sft → reason_rl`. It keeps the original model, tokenizer,
+engine and training stages unchanged. Reasoning uses ordinary `<think>` tags,
+calculator calls and a final `#### answer` line. Measured smoke results and the
+campaign status are in [the lab notebook](dev/REASONING_LOG.md); the full ablation
+campaign requires a separate post-smoke budget decision.
+
+Install with `uv sync --extra gpu --group dev`. A bounded single-GPU smoke
+pipeline, starting from an explicit input checkpoint, is:
+
+```bash
+bash runs/reasoning_singlegpu.sh sft d24 486 d24-reason-smoke
+```
+
+Every output tag must be fresh. Artifacts live outside Git under
+`NANOCHAT_BASE_DIR` (default `~/.cache/nanochat`): `reasonsft_checkpoints`,
+`reasonrl_checkpoints`, `reasoning_cache` and `reasoning_runs`. The runner defaults
+to 50 SFT iterations, five RL steps and bounded evaluations. `MODE=full` selects
+a full SFT epoch, 300 RL steps and full evaluation; use that mode only after
+deciding the measured compute budget. Override `RL_STEPS`, `DEVICE_BATCH_SIZE`,
+`TOTAL_BATCH_SIZE`, `SEED`, and `REWARD_MODE=binary|shaped` as needed.
+The runner monitors total GPU VRAM and cancels only its own process above 80%
+(`GPU_VRAM_LIMIT` may lower that ceiling). The owner's other LLM training takes
+priority; defer this pipeline while it is active. Direct stage commands below
+can be wrapped with `uv run --no-sync python -m scripts.reason_gpu_guard -- ...`
+for the same ceiling.
+
+Individual stages and evaluation can also be run directly:
+
+```bash
+uv run --no-sync python -m scripts.reason_sft \
+  --source sft --model-tag d24 --model-step 486 --output-tag d24-reason-sft
+uv run --no-sync python -m scripts.reason_rl \
+  --source reason_sft --model-tag d24-reason-sft --output-tag d24-shaped-42 \
+  --reward-mode shaped --seed 42 --num-steps 300
+uv run --no-sync python -m scripts.reason_eval \
+  --source reason_rl --model-tag d24-shaped-42 \
+  --output-dir "$HOME/.cache/nanochat/reasoning_runs/d24-shaped-42-eval"
+uv run --no-sync python -m scripts.chat_cli \
+  -i reason_rl -g d24-shaped-42 --max-new-tokens 1024
+```
+
+The dedicated evaluator reports binary greedy pass@1 and sampled pass@8,
+per-task Wilson intervals, response tokens, stop reasons, elapsed time and raw
+completions. Keep its 1024-token budget and data/sampling seeds identical across
+arms. Existing `chat_eval` callers retain their defaults; its CLI uses 1024 tokens
+for reasoning sources and 512 for older sources. Interactive CLI output dims
+think content, including tags split across streamed chunks; redirected output
+stays plain text. Use `--help` for each stage's full controls.
+
+SFT defaults to four GSM8K passes, 25,000 numeric MetaMathQA rows, 25,000 numeric
+OpenMathInstruct-2 `train_1M` rows, 15,000 procedural examples, and 25% unchanged
+SmolTalk/MMLU replay. It drops oversized traces without cropping (1536 total,
+1024 per assistant turn including tools), reserves validation before oversampling
+and excludes exact normalized evaluation questions. This does not establish the
+absence of semantic contamination. Source licenses, revisions and inspected
+schemas are recorded in the notebook; OpenMathInstruct-2 is CC BY 4.0, and its
+derived training data must retain the source attribution.
+
+Shaped rewards keep incorrect responses at or below .5 and correct responses at
+or above .7, with format, partial answer, verified intermediates and penalties
+only adjusting scores within those bands. `--process-weight-final` defaults to
+.1. Unavailable process verification is explicitly marked and scored neutrally.
+Reward totals are training diagnostics, not evaluation metrics. Multi-GPU code
+paths are retained but have not been validated on multiple GPUs.
+
+Run `uv run --no-sync python -m pytest -m "not slow"` for offline acceptance
+tests. See [the design](dev/REASONING_DESIGN.md) for reward details, preserved
+baseline files, smoke gates and the A/B/C/D experiment protocol.
