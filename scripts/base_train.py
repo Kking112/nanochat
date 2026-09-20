@@ -492,7 +492,10 @@ study = bool(args.arm) and master_process # log this run as an arm of the study
 if study:
     from nanochat.flash_attention import USE_FA3 as attn_is_fa3
     git = lambda *cmd: subprocess.run(["git", *cmd], capture_output=True, text=True).stdout.strip()
-    git_hash = git("rev-parse", "HEAD") + ("-dirty" if git("status", "--porcelain") else "")
+    # Dirty = modified or untracked files in the code and its environment. Not the whole repo: the
+    # results of earlier runs are untracked files too, and would mark every later run as dirty.
+    CODE_PATHS = ["nanochat", "scripts", "runs", "tasks", "tests", "pyproject.toml", "uv.lock"]
+    git_hash = git("rev-parse", "HEAD") + ("-dirty" if git("status", "--porcelain", "--", *CODE_PATHS) else "")
     run_id = f"{output_dirname}_{time.strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(os.path.join(args.results_dir, "logs"), exist_ok=True)
     jsonl_path = os.path.join(args.results_dir, "logs", f"{run_id}.jsonl")
