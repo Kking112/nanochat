@@ -389,3 +389,24 @@ Decision rule (3.4): supported iff difference > 2 x pooled SD AND all seeds of o
 **Phase 2 gate (3.5): H1 supported => proceed to the larger-width confirmation.**
 
 Compute: Phase 1 total 32.4 + 16.7 + ~9.4 (loop sweep) = ~58 GPU-hours, 2.4 GPU-days.
+
+---
+
+## 2026-09-22: Phase 2 design (decided before any Phase 2 run)
+
+Author's decisions: **d20 width** (the proposal allowed d16 or d20; d16 would have been ~16 GPU-h,
+d20 is ~58 GPU-h), and the matrix LR by a **mini-sweep on B_U** at 40% horizon, seed 0, selecting by
+val_bpb with 1x preferred when the two are within 0.003 bpb; the grid depends on a stability check
+of the Phase 1b runs at 2x. Implemented in `runs/looped_phase2.sh`.
+
+- Stability check of all 21 full-horizon 2x runs: largest single-step rise of the smoothed loss
+  0.020-0.032, at the same steps (233, 878, 994, 1664) across arms, i.e. data batches, not
+  instability; val_bpb monotone at every one of the 12 evals in every run; grad norm never above
+  2.0x its median. **No instability => grid {1x, 2x}.**
+- Arms: `d20_B20` = layout `20` (B_E, 393M block params), `d20_B12` = `12` (B_U), `d20_L12` =
+  `2,8x2,2` (U = 12, E = 20, same sharing ratio as L8). dim 1280, 10 heads. Reference horizon:
+  12 x 435M = 5.22B tokens, auto batch 1,048,576, 4980 steps. Data: Phase 1 consumed 29 of the 170
+  shards for 1.32B tokens, so 5.22B needs ~115 shards: single epoch.
+- Smoke (15 steps, scratch dirs): B20 and L12 both 77.6k tok/s, 73.6 / 70.8 GB at device batch
+  32, FLOPs/token 3.240e9 for both (equal, as at d12). Estimates: 18.7 h per E = 20 run, ~11.5 h
+  for B_U, 4.6 h per mini-sweep run: ~58 GPU-hours total.
