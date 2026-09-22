@@ -333,3 +333,59 @@ Next: main matrix, `bash runs/looped_main.sh` (7 arms x seeds 0,1,2 at 2x, full 
 per E = 12 run, ~1.4 GPU-days in total. `scripts/looped_analyze.py` (decision rule, rho, figures)
 was written and tested on synthetic data on 2026-09-20, before any main-matrix run existed, and is
 merged before the main matrix starts.
+
+---
+
+## 2026-09-22: Phase 1b main matrix and loop sweep. Pre-registered verdicts
+
+`bash runs/looped_main.sh` (2026-09-20 17:56 to 2026-09-22 00:30, 21 runs, 32.4 GPU-hours) and
+`bash runs/looped_loopsweep.sh` (00:33 to 09:54, 42 evaluations). All at `967caca`, clean hashes,
+data hash `a1413887432d...` in every run, **0 diverged of 21**. `python -m scripts.looped_analyze`
+wrote `results/analysis.md` and `results/figures/F1-F6`; the numbers below are copied from it.
+
+| arm | layout | U/E | block params | VE params | val_bpb (s0, s1, s2) | mean | SD | CORE | tok/s | VRAM |
+|---|---|---|---|---|---|---|---|---|---|---|
+| B12 | `12` | 12/12 | 84.9M | 151.0M | 0.85060, 0.85094, 0.85108 | **0.85087** | 0.00025 | 0.149 | 266k | 28.8 GB |
+| L8 | `2,4x2,2` | 8/12 | 56.6M | 100.7M | 0.86001, 0.85901, 0.86005 | **0.85969** | 0.00059 | 0.149 | 268k | 28.2 GB |
+| LR | `2,4xR,2` | 8/8-20 | 56.6M | 100.7M | 0.86493, 0.86523, 0.86529 | **0.86515** | 0.00019 | 0.139 | 265k | 42.8 GB |
+| B8 | `8` | 8/8 | 56.6M | 100.7M | 0.87034, 0.86979, 0.86921 | **0.86978** | 0.00057 | 0.137 | 367k | 20.9 GB |
+| L6p | `0,6x2,0` | 6/12 | 42.5M | 75.5M | 0.86979, 0.87083, 0.87116 | **0.87059** | 0.00071 | 0.148 | 270k | 27.9 GB |
+| L6s | `2,2x4,2` | 6/12 | 42.5M | 75.5M | 0.87129, 0.87066, 0.87057 | **0.87084** | 0.00039 | 0.140 | 270k | 27.9 GB |
+| B6 | `6` | 6/6 | 42.5M | 75.5M | 0.88592, 0.88614, 0.88525 | **0.88577** | 0.00046 | 0.129 | 452k | 16.9 GB |
+
+Decision rule (3.4): supported iff difference > 2 x pooled SD AND all seeds of one arm beat all of the other.
+
+- **H1 SUPPORTED** (all three): L8 < B8 by 0.0101 (2 x pooled SD 0.0012); L6s < B6 by 0.0149
+  (0.0009); L6p < B6 by 0.0152 (0.0012). Every seed of every looped arm beats every seed of its
+  equal-parameter control. Looping helps at equal parameters, in this recipe, by 10-30 seed SDs.
+- **H2 SUPPORTED**: B12 < L8 by 0.0088 (0.0009). **rho(L8) = 0.534** (seed combinations 0.49 to
+  0.59), inside the predicted [0.3, 0.8]. rho(L6s) = 0.43, rho(L6p) = 0.44: looping recovers about
+  half of the loss that removing 4 layers costs, and a bit over 40% of the loss of removing 6.
+- **H3 INCONCLUSIVE**: L6s vs L6p differ by 0.0002 (threshold 0.0012); the seeds interleave. The
+  weak prediction "sandwich not worse than pure loop" is neither supported nor contradicted.
+- **H4, split verdict.** (a) Monotone decrease over R = 1..4: **NOT supported**, narrowly: for all
+  three seeds val_bpb falls 0.881 -> 0.865 -> 0.8625 from R = 1 to 3, then rises by 0.0002-0.0004 at
+  R = 4. The optimum of a model trained with R ~ U{1..4} is R = 3, not the largest trained R.
+  (b) R in {5, 6, 8} no worse than R = 4 by more than 0.005: **supported** for all seeds (worst
+  +0.0038 at R = 8). No improvement beyond R = 4 (hoped for, not predicted). The randomized-R model
+  is robust to the loop count: 0.8625-0.8670 across R = 2..8, all within 0.005 of each other.
+- **L8 control (trained at fixed R = 2):** collapses at any other R: 1.10 at R = 1, 0.99 at 3, 1.07
+  at 4, 1.3-1.4 at 5-8 (CORE 0.03-0.07). Without randomized-R training there is no test-time loop
+  scaling at all. F4.
+- **Price of loop-count robustness:** LR at its evaluation R = 2 is 0.0055 worse than L8 (same
+  parameters, same layout), and 0.0026 worse at its best R = 3; it also costs 13% more training
+  FLOPs (mean E = 14) and 42.8 GB VRAM.
+- CORE (secondary, descriptive): tracks val_bpb loosely. L8 = B12 = 0.149 despite 0.009 bpb between
+  them; L6p 0.148 vs L6s 0.140 with equal bpb. Seed SD of CORE is 0.003-0.009 per arm, consistent
+  with the 0.005 same-seed floor from Phase 0. H5 (reasoning-like vs recall tasks) is not analysed
+  here: at this floor the per-task differences are not interpretable.
+- Efficiency (tertiary): the equal-compute arms match B12's throughput (266-270k tok/s) and VRAM
+  within 3%; B8 is 1.38x and B6 1.70x faster. Weight sharing buys parameters, not wall-clock.
+- F6 (residual RMS through depth): the looped arms grow more slowly through their second core pass
+  than B12 does through layers 7-12 (end at 27-29 vs 33); no instability, consistent with 0
+  divergences. L6p's first layer (RMS 10) differs from every other arm (15-19): with no prelude the
+  first core visit sees the raw embedding.
+
+**Phase 2 gate (3.5): H1 supported => proceed to the larger-width confirmation.**
+
+Compute: Phase 1 total 32.4 + 16.7 + ~9.4 (loop sweep) = ~58 GPU-hours, 2.4 GPU-days.
