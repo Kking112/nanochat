@@ -70,6 +70,6 @@ train_arm() { # arm lr_mult horizon_frac seed [extra base_train args...]
         --matrix-lr-mult "$lr_mult" --horizon-frac "$horizon_frac" --seed "$seed" \
         --device-batch-size "$DEVICE_BATCH_SIZE" \
         --arm "$arm" --model-tag "$tag" --results-dir "$RESULTS_DIR" --run "$WANDB_RUN" \
-        --sample-every -1 --no-save-optimizer \
+        --sample-every -1 --no-save-optimizer --num-checkpoints 20 --auto-resume \
         "$@" 2>&1 | tee "$RESULTS_DIR/stdout/${tag}_$(date +%Y%m%d_%H%M%S).log"
 }
