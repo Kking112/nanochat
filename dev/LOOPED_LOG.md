@@ -410,3 +410,24 @@ of the Phase 1b runs at 2x. Implemented in `runs/looped_phase2.sh`.
 - Smoke (15 steps, scratch dirs): B20 and L12 both 77.6k tok/s, 73.6 / 70.8 GB at device batch
   32, FLOPs/token 3.240e9 for both (equal, as at d12). Estimates: 18.7 h per E = 20 run, ~11.5 h
   for B_U, 4.6 h per mini-sweep run: ~58 GPU-hours total.
+
+---
+
+## 2026-09-24: Phase 2 mini-sweep done (1x selected); B_E run lost to a power outage, restarted
+
+- Mini-sweep on `d20_B12` (B_U), 40% horizon (1992 steps, 2.09B tokens), seed 0, at `2349a33`:
+  **1x: 0.79705, 2x: 0.79730**. The difference (0.00025) is within the 0.003 band, so by the
+  pre-set rule **1x is selected** for all three Phase 2 arms (`results/selected_lr_phase2.json`).
+  At d20 and this horizon the stock `matrix_lr` is as good as 2x, unlike at d12 / 40% in Phase 1a.
+  Both runs 4.9 h, 125.6k tok/s (12 layers at dim 1280), 46.4 GB, 0 diverged.
+- **Power outage** at ~16:12 on 2026-09-23 killed `looped_d20_B20_lr1.0_h1.0_s0` at step 2720 of
+  4980 (10.1 h in). The machine was down until 22:45 on 2026-09-24. No results row and no checkpoint
+  were written (checkpoints are written at the last step only), so nothing of the run is usable and,
+  per the no-mid-run-resume rule, it is **rerun from scratch**. Its partial logs
+  (`results/logs/looped_d20_B20_lr1.0_h1.0_s0_20260923_053920.jsonl`, 51 complete lines to step
+  2700, and the matching stdout log) are kept as written and are not part of any analysis; the rerun
+  gets a new run id. Integrity checked before restarting: `looped_results.csv` has 54 complete rows
+  and an intact last line; the two sweep checkpoints were written 10+ h before the outage and have
+  identical sizes; `git fsck` clean; the code tree identical to `2349a33`; CUDA works after reboot.
+- Restart: `bash runs/looped_phase2.sh` skips the two sweep runs, recomputes the same selection and
+  runs `d20_B20`, `d20_B12`, `d20_L12` at 1x: ~49 GPU-hours remaining.
