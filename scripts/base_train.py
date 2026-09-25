@@ -14,7 +14,9 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
+import re
 import csv
+import sys
 import json
 import time
 import math
@@ -91,7 +93,10 @@ parser.add_argument("--seed", type=int, default=-1, help="seed for parameter ini
 parser.add_argument("--train-loops", type=str, default="", help="with --layout: comma-separated loop counts, e.g. '1,2,3,4'. One is sampled uniformly per optimizer step. Evaluation uses the layout's own R.")
 parser.add_argument("--arm", type=str, default="", help="name of the study arm. If given, the run is logged to <results-dir>/logs/*.jsonl and appended as one row to <results-dir>/looped_results.csv")
 parser.add_argument("--results-dir", type=str, default="results", help="where --arm writes its results")
-parser.add_argument("--no-save-optimizer", action="store_true", help="do not save optimizer state in checkpoints (saves disk, the run can then not be resumed)")
+parser.add_argument("--no-save-optimizer", action="store_true", help="do not save optimizer state in the final checkpoint (saves disk). Intermediate checkpoints (--num-checkpoints) always include it")
+parser.add_argument("--num-checkpoints", type=int, default=0, help="save this many evenly spaced intermediate checkpoints (with optimizer state) during the run, each replacing the previous one, so that an interrupted run can be resumed with --auto-resume")
+parser.add_argument("--auto-resume", action="store_true", help="if the checkpoint directory holds an intermediate checkpoint of this run, resume from it. The data stream is replayed exactly (not the approximate --resume-from-step): the resumed run trains on the same tokens in the same order as an uninterrupted one")
+parser.add_argument("--exit-after-step", type=int, default=-1, help="testing only: exit right after the checkpoint of this step was saved, to simulate an interruption")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 if args.layout:
@@ -103,6 +108,8 @@ if args.layout:
     assert args.ref_layout, "--layout requires --ref-layout (use the arm's own layout for a standalone model)"
 else:
     assert not (args.ref_layout or args.train_loops or args.horizon_frac != 1.0), "--ref-layout, --train-loops and --horizon-frac require --layout"
+if args.auto_resume:
+    assert args.num_checkpoints > 0 and args.resume_from_step == -1, "--auto-resume goes with --num-checkpoints and replaces --resume-from-step"
 train_loops = sorted({int(r) for r in args.train_loops.split(",")}) if args.train_loops else []
 script_t0 = time.time()
 # -----------------------------------------------------------------------------
@@ -191,10 +198,26 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+if args.auto_resume and os.path.isdir(checkpoint_dir):
+    # The latest complete intermediate checkpoint: all three files present (the meta file is written
+    # last and every file is renamed into place, so a checkpoint cut short by a crash is never complete)
+    saved_steps = sorted(int(f[len("model_"):-len(".pt")]) for f in os.listdir(checkpoint_dir) if re.match(r"model_\d+\.pt$", f))
+    complete = [s for s in saved_steps
+                if os.path.exists(os.path.join(checkpoint_dir, f"meta_{s:06d}.json")) and os.path.exists(os.path.join(checkpoint_dir, f"optim_{s:06d}_rank{ddp_rank:d}.pt"))]
+    if complete:
+        args.resume_from_step = complete[-1]
+        print0(f"Auto-resume: found intermediate checkpoint at step {args.resume_from_step} in {checkpoint_dir}")
 resuming = args.resume_from_step != -1
+exact_resume = resuming and args.auto_resume # replay the data stream instead of the approximate dataloader resume
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    if exact_resume:
+        # the checkpoint must be from this very run configuration, or the resumed run is a chimera
+        same = {k: meta_data["user_config"].get(k) for k in ("layout", "width_depth", "ref_layout", "seed", "matrix_lr_mult", "horizon_frac", "train_loops", "arm", "depth", "total_batch_size", "max_seq_len")}
+        mine = {k: user_config.get(k) for k in same}
+        assert same == mine, f"checkpoint is from a different run configuration:\n{same}\n{mine}"
+        assert not meta_data["loop_state"].get("final", False), "this run already finished"
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -377,7 +400,9 @@ if scaler is not None:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+# With an exact resume the loader starts from the beginning and is fast-forwarded below (the stream
+# is deterministic and does not depend on the seed), instead of the approximate row-group resume.
+dataloader_resume_state_dict = None if (not resuming or exact_resume) else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
@@ -472,11 +497,25 @@ def hash_data(inputs, targets):
     # called on receipt of every batch: the dataloader reuses its buffers
     global data_hash_rows
     n = min(len(inputs), DATA_HASH_ROWS - data_hash_rows)
-    if n > 0 and args.arm and not resuming: # the .cpu() is a sync point: keep it off the stock path
+    if n > 0 and args.arm and (not resuming or exact_resume): # the .cpu() is a sync point: keep it off the stock path
         rows = torch.cat([inputs[:n], targets[:n]], dim=1).cpu().numpy() # row by row: (input, target) pairs
         data_hasher.update(rows.tobytes())
         data_hash_rows += n
 hash_data(x, y)
+if exact_resume:
+    # Replay the stream up to the batch the interrupted run would have used next. Before the
+    # interruption the loop had consumed 1 (the first prefetch) + step * grad_accum batches; x holds
+    # batch 0 now, so after step * grad_accum more fetches it holds the right one. The hash of the
+    # leading rows is rebuilt on the way, so the data check covers a resumed run too.
+    skip = args.resume_from_step * (total_batch_size // (args.device_batch_size * args.max_seq_len * ddp_world_size))
+    print0(f"Exact resume: replaying {skip:,} micro-batches of the data stream ...")
+    t_replay = time.time()
+    for i in range(skip):
+        x, y, dataloader_state_dict = next(train_loader)
+        hash_data(x, y)
+        if (i + 1) % 2000 == 0:
+            print0(f"  replayed {i + 1:,}/{skip:,} micro-batches ({time.time() - t_replay:.0f}s)")
+    print0(f"Exact resume: data stream at step {args.resume_from_step} after {time.time() - t_replay:.0f}s")
 
 # Core blocks are the ones that are visited more than once
 core_layers = range(model_config.n_prelude, model_config.n_prelude + model_config.n_core) if model_config.n_prelude >= 0 else range(0)
@@ -496,10 +535,15 @@ if study:
     # results of earlier runs are untracked files too, and would mark every later run as dirty.
     CODE_PATHS = ["nanochat", "scripts", "runs", "tasks", "tests", "pyproject.toml", "uv.lock"]
     git_hash = git("rev-parse", "HEAD") + ("-dirty" if git("status", "--porcelain", "--", *CODE_PATHS) else "")
-    run_id = f"{output_dirname}_{time.strftime('%Y%m%d_%H%M%S')}"
-    os.makedirs(os.path.join(args.results_dir, "logs"), exist_ok=True)
-    jsonl_path = os.path.join(args.results_dir, "logs", f"{run_id}.jsonl")
-    assert not os.path.exists(jsonl_path), f"refusing to overwrite the log of a past run: {jsonl_path}"
+    if exact_resume and meta_data["loop_state"].get("run_id"):
+        # the same run continues: keep its id and append to its log
+        run_id = meta_data["loop_state"]["run_id"]
+        jsonl_path = os.path.join(args.results_dir, "logs", f"{run_id}.jsonl")
+    else:
+        run_id = f"{output_dirname}_{time.strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(os.path.join(args.results_dir, "logs"), exist_ok=True)
+        jsonl_path = os.path.join(args.results_dir, "logs", f"{run_id}.jsonl")
+        assert not os.path.exists(jsonl_path), f"refusing to overwrite the log of a past run: {jsonl_path}"
     # a fixed batch of validation rows for the residual stream diagnostics
     diag_x = next(build_val_loader())[0][:4].clone()
 def log_event(kind, **data):
@@ -568,6 +612,18 @@ val_bpb_history = {} # step -> val bpb
 step_times = [] # seconds per step, after the first 10 steps
 final_core_metric = None
 diverged = False
+wall_clock_before = 0.0 # wall-clock of earlier segments of this run, if resumed
+ckpt_every = num_iterations // args.num_checkpoints if args.num_checkpoints > 0 else 0
+last_intermediate_step = None # the intermediate checkpoint to delete after the next one is saved
+if exact_resume:
+    saved = meta_data["loop_state"]
+    val_bpb_history = {int(k): v for k, v in saved["val_bpb_history"].items()}
+    step_times = saved["step_times"]
+    final_core_metric = saved["final_core_metric"]
+    diverged = saved["diverged"]
+    wall_clock_before = saved["wall_clock_s"]
+    last_intermediate_step = args.resume_from_step
+    log_event("resume", step=step, git_hash=git_hash if study else None, wall_clock_before=wall_clock_before)
 
 # Go!
 while True:
@@ -648,12 +704,13 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    intermediate = not last_step and step > 0 and step != args.resume_from_step and ckpt_every > 0 and step % ckpt_every == 0
+    if last_step or intermediate or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
-            None if args.no_save_optimizer else optimizer.state_dict(), # optimizer state
+            None if (args.no_save_optimizer and not intermediate) else optimizer.state_dict(), # optimizer state: an intermediate checkpoint exists to be resumed from
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -667,10 +724,31 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    # the rest is what --auto-resume needs to continue the study's bookkeeping
+                    "val_bpb_history": val_bpb_history,
+                    "step_times": step_times,
+                    "final_core_metric": final_core_metric,
+                    "diverged": diverged,
+                    "wall_clock_s": wall_clock_before + time.time() - script_t0,
+                    "run_id": run_id if study else None,
+                    "final": last_step,
                 },
             },
             rank=ddp_rank,
         )
+        if intermediate or last_step:
+            # the checkpoint before this one has served its purpose
+            if last_intermediate_step is not None and last_intermediate_step != step:
+                for name in ([f"model_{last_intermediate_step:06d}.pt", f"meta_{last_intermediate_step:06d}.json"] if ddp_rank == 0 else []) + [f"optim_{last_intermediate_step:06d}_rank{ddp_rank:d}.pt"]:
+                    path = os.path.join(checkpoint_dir, name)
+                    if os.path.exists(path):
+                        os.remove(path)
+            last_intermediate_step = step
+        if intermediate and step == args.exit_after_step:
+            print0(f"--exit-after-step {step}: exiting right after the checkpoint, as if interrupted")
+            wandb_run.finish()
+            compute_cleanup()
+            sys.exit(0)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -808,7 +886,7 @@ if study:
         "tokens_per_sec": round(timed_steps * total_batch_size / total_training_time) if total_training_time > 0 else None,
         # the mean above suffers from anything else that uses the GPU during the run, the median step does not
         "tokens_per_sec_median": round(total_batch_size / sorted(step_times)[len(step_times) // 2]) if step_times else None,
-        "peak_vram_mib": round(get_max_memory() / 1024 / 1024), "wall_clock_s": round(time.time() - script_t0),
+        "peak_vram_mib": round(get_max_memory() / 1024 / 1024), "wall_clock_s": round(wall_clock_before + time.time() - script_t0),
         "diverged": int(diverged), "git_hash": git_hash,
         "train_loops": args.train_loops, "model_tag": output_dirname, "run_id": run_id,
         "data_sha256": data_hasher.hexdigest() if data_hash_rows > 0 else None, "data_hash_rows": data_hash_rows,

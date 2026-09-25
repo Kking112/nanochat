@@ -42,24 +42,33 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
+def _atomic_torch_save(data, path):
+    """Write to a temporary file and rename it into place, so that a crash mid-write (e.g. a power
+    cut) can never leave a truncated file under the final name. os.replace is atomic on POSIX."""
+    tmp_path = path + ".tmp"
+    torch.save(data, tmp_path)
+    os.replace(tmp_path, path)
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
+        _atomic_torch_save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
-        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
-        logger.info(f"Saved metadata to: {meta_path}")
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
+        _atomic_torch_save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+    if rank == 0:
+        # The metadata is written last: a checkpoint whose meta file exists is complete
+        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+        with open(meta_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, indent=2)
+        os.replace(meta_path + ".tmp", meta_path)
+        logger.info(f"Saved metadata to: {meta_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state

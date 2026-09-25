@@ -431,3 +431,39 @@ of the Phase 1b runs at 2x. Implemented in `runs/looped_phase2.sh`.
   identical sizes; `git fsck` clean; the code tree identical to `2349a33`; CUDA works after reboot.
 - Restart: `bash runs/looped_phase2.sh` skips the two sweep runs, recomputes the same selection and
   runs `d20_B20`, `d20_B12`, `d20_L12` at 1x: ~49 GPU-hours remaining.
+
+---
+
+## 2026-09-24 (later): intermediate checkpoints with exact resume; Phase 2 relaunched
+
+After the outage the author asked for periodic checkpointing (20 per run, each replacing the last).
+Checkpoints are only useful with a resume, and the stock resume is approximate (it skips a row
+group, which changes the token stream and would break the identical-data-order protocol of 3.2).
+So resume was made exact instead:
+
+- `--num-checkpoints 20`: every `num_iterations // 20` steps (249 for the d20 runs, ~56 min) a
+  checkpoint with optimizer state is written and the previous intermediate one is deleted after
+  the new one is complete. Files are written to a temporary name and renamed into place, and the
+  meta file last, so a crash mid-save can never leave a truncated checkpoint that looks complete.
+- `--auto-resume`: picks the latest complete intermediate checkpoint of the same run
+  configuration (asserted against the saved `user_config`), restores model, optimizer and the
+  study's loop state (val_bpb history, step times, wall-clock of earlier segments, run id, so the
+  JSONL log is continued and the results row is that of one run), and then **replays the data
+  stream** from the start up to the interruption point. The stream is deterministic and seed
+  independent, so the resumed run trains on exactly the batches an uninterrupted run would have.
+  The leading-rows hash is rebuilt during the replay, so the data check holds for resumed runs.
+  Replay speed measured at d20: 320 micro-batches (21M tokens) in 6 s, ~3.5M tok/s: a worst-case
+  replay of a whole d20 stream is ~25 min. Cost of an interruption is therefore at most ~56 min of
+  training plus the replay.
+- `--exit-after-step N` (testing only) exits right after the checkpoint of step N, to simulate an
+  interruption. T10 (`tests/test_looped.py`) runs an uninterrupted 20-step CPU run against one cut
+  at step 10 and resumed: same losses step for step (within 2e-3, fp32 CPU summation order), same
+  data hash, one results row, one continued log, only the final checkpoint left. A d20-scale smoke
+  (40 steps, cut at 20) behaved the same: smooth loss across the resume, study data hash reproduced.
+- `runs/looped_common.sh` now passes `--num-checkpoints 20 --auto-resume` to every study run. The
+  stock path (no flags) is unchanged. Full suite: 71 passed, 10 skipped.
+- Caveat for the paper: a resumed run is not bit-identical to an uninterrupted one (bf16 GPU
+  training is not run-to-run deterministic anyway, ~1e-4 in loss by step 30, see 2026-09-19), and
+  its throughput row mixes segments; `tokens_per_sec_median` is robust to that. Whether a Phase 2
+  row was resumed is visible in its JSONL log (`resume` events).
+- The `d20_B20` rerun that started at 22:58 was stopped at step 5 for this change and relaunched.

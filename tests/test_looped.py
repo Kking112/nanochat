@@ -384,7 +384,7 @@ needs_data = pytest.mark.skipif(
     reason="needs the trained tokenizer and the pretraining data shards in the nanochat base dir")
 
 
-def run_base_train(tmp_path, tag, *args):
+def run_base_train(tmp_path, tag, *args, expect_row=True):
     """
     Run a 20 step scripts.base_train on CPU. Checkpoints go to a scratch base dir that only links
     the real tokenizer and data, and results to a scratch results dir: a test must never touch
@@ -404,13 +404,15 @@ def run_base_train(tmp_path, tag, *args):
         "--model-tag", f"looped_test_{tag}", "--arm", tag, "--results-dir", str(results_dir), *args]
     proc = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    losses = [float(x) for x in re.findall(r"^step \d+/\d+ .*? loss: ([\d.]+)", proc.stdout, flags=re.M)]
+    if not expect_row:
+        return proc.stdout, losses
     with open(results_dir / "looped_results.csv", newline="") as f:
         rows = list(csv.DictReader(f))
     assert len(rows) == 1
     logs = list((results_dir / "logs").glob("*.jsonl"))
     assert len(logs) == 1
     events = [json.loads(line) for line in logs[0].read_text().splitlines()]
-    losses = [float(x) for x in re.findall(r"^step \d+/\d+ .*? loss: ([\d.]+)", proc.stdout, flags=re.M)]
     return rows[0], events, losses
 
 
@@ -470,3 +472,35 @@ def test_t9_smoke(tmp_path, tag, args):
         assert int(row["train_flops"]) == config["num_flops_per_token"] * 20 * 1024
     train = next(e for e in events if e["kind"] == "train")
     assert train["grad_norm_noncore"] > 0 and (train["grad_norm_core"] > 0) == (tag != "plain")
+
+
+@needs_data
+@pytest.mark.slow
+def test_t10_checkpoint_and_exact_resume(tmp_path):
+    """
+    A run interrupted right after an intermediate checkpoint and resumed with --auto-resume trains on
+    exactly the same batches as an uninterrupted run: same losses step for step, same data hash, one
+    results row, one log. Intermediate checkpoints replace each other; only the final one remains.
+    """
+    layout = ["--layout", "1,2x2,1", "--width-depth", "4", "--ref-layout", "4", "--seed", "0", "--device-batch-size", "2", "--num-checkpoints", "4"]
+    ref_row, _, ref_losses = run_base_train(tmp_path, "full", *layout)
+    ckpt = lambda tag: sorted(p.name for p in (tmp_path / "base" / "base_checkpoints" / f"looped_test_{tag}").iterdir())
+    assert ckpt("full") == ["meta_000020.json", "model_000020.pt"] # --no-save-optimizer: no optimizer in the final one
+
+    # interrupted at step 10 (checkpoints at 5, 10, 15: the one at 5 must already be gone)
+    out, part_losses = run_base_train(tmp_path, "cut", *layout, "--exit-after-step", "10", expect_row=False)
+    assert "exiting right after the checkpoint" in out and len(part_losses) == 10
+    assert ckpt("cut") == ["meta_000010.json", "model_000010.pt", "optim_000010_rank0.pt"]
+
+    row, events, losses = run_base_train(tmp_path, "cut", *layout, "--auto-resume")
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("config") == 2 and kinds.count("resume") == 1 and kinds[-1] == "final" # one log, continued
+    assert events[kinds.index("resume")]["step"] == 10
+    assert len(losses) == 10 and row["steps"] == "20"
+    assert row["data_sha256"] == ref_row["data_sha256"] and row["data_hash_rows"] == ref_row["data_hash_rows"]
+    # the resumed segment reproduces the uninterrupted run (CPU fp32; summation order can differ slightly)
+    for step, (a, b) in enumerate(zip(ref_losses[10:], losses), start=10):
+        assert abs(a - b) < 2e-3, f"step {step}: uninterrupted {a} vs resumed {b}"
+    assert abs(float(row["final_val_bpb"]) - float(ref_row["final_val_bpb"])) < 2e-3
+    assert ckpt("cut") == ["meta_000020.json", "model_000020.pt"] # the step-10 checkpoint was replaced by the final one
+    assert int(row["wall_clock_s"]) > 0
