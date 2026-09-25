@@ -1,0 +1,6 @@
+{
+  "d20_B20": 1.0,
+  "d20_B12": 1.0,
+  "d20_L12": 1.0,
+  "rule": "2x only if better than 1x by more than 0.003 bpb on d20_B12 at 40% horizon"
+}
