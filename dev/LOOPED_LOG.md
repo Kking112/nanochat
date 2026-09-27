@@ -467,3 +467,41 @@ So resume was made exact instead:
   its throughput row mixes segments; `tokens_per_sec_median` is robust to that. Whether a Phase 2
   row was resumed is visible in its JSONL log (`resume` events).
 - The `d20_B20` rerun that started at 22:58 was stopped at step 5 for this change and relaunched.
+
+---
+
+## 2026-09-27: Phase 2 results. H1 replicates at d20 (one seed), rho = 0.50
+
+`runs/looped_phase2.sh` (relaunched 2026-09-24 23:13, done 2026-09-27 01:54), three runs at
+`5675afc`, matrix LR 1x (selected by the mini-sweep), seed 0, 4980 steps of 1,048,576 tokens
+(5.22B), 0 diverged, clean hashes, data hash `a1413887432d...`. **No run needed a resume**: the
+checkpointing added on 2026-09-24 was never exercised in anger (no `resume` events in the logs).
+
+| arm | layout | U/E | block params | VE params | FLOPs/token | val_bpb @500 / @2500 / final | CORE | tok/s | VRAM | wall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| d20_B20 (B_E) | `20` | 20/20 | 393M | 419M | 3.240e9 | 0.9155 / 0.8043 / **0.73817** | 0.245 | 79.6k | 73.6 GB | 19.3 h |
+| d20_L12 | `2,8x2,2` | 12/20 | 236M | 252M | 3.240e9 | 0.9270 / 0.8134 / **0.74908** | 0.242 | 80.3k | 70.8 GB | 19.1 h |
+| d20_B12 (B_U) | `12` | 12/12 | 236M | 252M | 2.045e9 | 0.9323 / 0.8233 / **0.75982** | 0.216 | 125.7k | 46.4 GB | 12.2 h |
+
+- **H1 at d20: the looped model beats its equal-parameter control by 0.0107 bpb** (0.74908 vs
+  0.75982), with the same sign and about the same size as at d12 (L8 vs B8: 0.0101). One seed, so
+  the 3.4 decision rule can not be applied; against the d12 seed SDs (0.0003-0.0007) a 0.011 gap is
+  ~20 SD, and the same-seed noise floor is 1e-4. The ordering B_E < looped < B_U holds at every one
+  of the 20 evals, from step 250 on.
+- **H2 at d20:** B20 beats L12 by 0.0109. **rho(d20_L12) = 0.496**, vs 0.534 at d12: looping
+  again recovers about half of the loss that removing the 8 layers costs, at 5.5x the block
+  parameters and 4x the tokens. The recovery fraction did not shrink with scale within this range.
+- CORE: B20 0.245, L12 0.242, B12 0.216. The looped model's CORE is within 0.003 of B_E (the
+  same pattern as L8 = B12 at d12) while its val_bpb sits halfway; single seed, floor 0.005.
+- Efficiency: L12 matches B20's throughput and VRAM (equal FLOPs per token); B12 is 1.58x faster.
+  Learned `backout_lambda` at the end: B20 0.19, B12 0.16, L12 0.08 (at d12: 0.34 for B12).
+- Residual RMS through depth at the end of training: L12's second core pass grows more slowly
+  (40-58 over effective layers 11-20) than B20's layers 11-20 (46-78). No instability.
+- Phase 2 total: 50.6 GPU-hours for the three runs + 9.8 for the mini-sweep + 10.1 lost to the
+  power outage. Study total (Phases 0-2): ~130 GPU-hours including the lost run.
+
+Orphan logs not part of any analysis: `looped_d20_B20_lr1.0_h1.0_s0_20260923_053920.jsonl`
+(power outage, step 2720) and `..._20260924_225453.jsonl` (stopped at step 5 to add checkpointing).
+
+**Next: the write-up (deliverable 7.3) and the README summary with F1 and F3.** Phase 3 (SFT,
+chat evals, synthetic probes) is optional and is blocked by the `chat_sft.py` layout-keys issue.

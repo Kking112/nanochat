@@ -1,0 +1,72 @@
+
+                                                       █████                █████
+                                                      ░░███                ░░███
+     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
+    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
+     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
+     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
+     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
+    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
+    
+Autodetected device type: cuda
+2026-09-24 22:54:52,979 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+2026-09-24 22:54:52,979 - nanochat.common - [33m[1mWARNING[0m - Peak flops undefined for: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, MFU will show as 0%
+GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition | Peak FLOPS (BF16): inf
+COMPUTE_DTYPE: torch.bfloat16 (auto-detected: CUDA SM 120 (bf16 supported))
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback
+WARNING: Training will be less efficient without FA3
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+Vocab size: 32,768
+Model config:
+{
+  "sequence_len": 2048,
+  "vocab_size": 32768,
+  "n_layer": 20,
+  "n_head": 10,
+  "n_kv_head": 10,
+  "n_embd": 1280,
+  "window_pattern": "L",
+  "n_prelude": 20,
+  "n_core": 0,
+  "n_coda": 0,
+  "n_loop": 1
+}
+Parameter counts:
+wte                     : 41,943,040
+value_embeds            : 419,430,400
+lm_head                 : 41,943,040
+transformer_matrices    : 393,217,200
+scalars                 : 66
+total                   : 896,533,746
+unique_layers           : 20
+effective_layers        : 20
+Estimated FLOPs per token: 3.240107e+09
+Horizon and derived hyperparameters use reference layout 20: 435,160,240 scaling params (this model: 435,160,240)
+Auto-computed optimal batch size: 1,048,576 tokens
+Scaling LRs by 1.4142 for batch size 1,048,576 (reference: 524,288)
+Scaling weight decay from 0.280000 to 0.100188 for layout 20
+Scaling the LR for the AdamW parameters ∝1/√(1280/768) = 0.774597
+Calculated number of iterations from target data:param ratio: 4,980
+Total number of training tokens: 5,221,908,480
+Tokens : Scaling params ratio: 12.00
+Total training FLOPs estimate: 1.691954e+19
+Parameter table:
+  unique block params                     : 393,217,200
+  lm_head                                 : 41,943,040
+  wte                                     : 41,943,040
+  value embed params (lookups, no FLOPs)  : 419,430,400
+  scalars                                 : 66
+  unique layers U                         : 20
+  effective layers E                      : 20
+  FLOPs per token                         : 3,240,107,184
+Tokens / micro-batch / rank: 32 x 2048 = 65,536
+Tokens / micro-batch: 65,536
+Total batch size 1,048,576 => gradient accumulation steps: 16
+Step 00000 | Validation bpb: 3.171590
+step 00000/04980 (0.00%) | loss: 10.398570 | lrm: 0.03 | dt: 46738.68ms | tok/sec: 22,434 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 2 | total time: 0.00m
+step 00001/04980 (0.02%) | loss: 10.374524 | lrm: 0.05 | dt: 12847.72ms | tok/sec: 81,615 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 4 | total time: 0.00m
+step 00002/04980 (0.04%) | loss: 10.331403 | lrm: 0.07 | dt: 13015.96ms | tok/sec: 80,560 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 6 | total time: 0.00m
+step 00003/04980 (0.06%) | loss: 10.266852 | lrm: 0.10 | dt: 13082.64ms | tok/sec: 80,150 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 8 | total time: 0.00m
+step 00004/04980 (0.08%) | loss: 10.165394 | lrm: 0.12 | dt: 13122.37ms | tok/sec: 79,907 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 11 | total time: 0.00m
+step 00005/04980 (0.10%) | loss: 9.995104 | lrm: 0.15 | dt: 13139.48ms | tok/sec: 79,803 | bf16_mfu: 0.00 | epoch: 1 pq: 0 rg: 13 | total time: 0.00m
