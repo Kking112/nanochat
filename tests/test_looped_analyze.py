@@ -34,7 +34,7 @@ def write_results(results_dir):
             run_id = f"looped_{arm}_s{seed}"
             n_loop = 2 if "x" in layout else 1
             events = [{"kind": "config", "run_id": run_id, "model_config": {"n_loop": n_loop},
-                       "param_counts": {"transformer_matrices": U * 7077888, "value_embeds": 0, "unique_layers": U, "effective_layers": E}}]
+                       "param_counts": {"transformer_matrices": U * 7077888, "value_embeds": 0, "total": U * 7077888 + 50331648, "unique_layers": U, "effective_layers": E}}]
             for step in (0, 500, 2520):
                 events.append({"kind": "eval", "step": step, "val_bpb": (v or 9.0) + 1.0 / (1 + step)})
                 events.append({"kind": "diag", "step": step, "residual_rms": {str(n_loop): [float(i) for i in range(E)]}})

@@ -531,3 +531,38 @@ are 17-35 pooled SDs; LR's best-R cost vs L8 is 0.0030; VRAM is now in GiB; the 
 is 1792 tokens; LR's throughput is given as tokens per wall-clock second (238k) with its per-step
 median (265k) footnoted; main-run B12 `backout_lambda` is 0.39-0.44; the Appendix A learning-rate
 sensitivity comparison and the Appendix B largest-gains list were made complete.
+
+---
+
+## 2026-09-27 (later still): external review of the paper; changes made
+
+An external AI review of the paper and results raised six points. Validated against `results/`
+and acted on as follows.
+
+1. **The selected 2x learning rate was too high for the full horizon.** Valid and important: the
+   two Phase 0 runs of B12 at stock 1x (seed 0, full horizon) reached 0.847663 and 0.847748,
+   the three main-matrix B12 runs at 2x reached 0.85087 +/- 0.00025, i.e. 0.0032 worse, 12.9 seed
+   SDs. The d20 mini-sweep (longer absolute horizon) had 1x and 2x tied. The pre-registered
+   selection rule was followed as written, but the paper now states this side by side in 2.4 and
+   in Limitations. The reviewer's suggested check, B8 and L8 at 1x for one seed (~3 GPU-hours) to
+   get rho at 1x at d12 as a post-hoc appendix, is proposed to the author (not run yet).
+2. **Lead with total stored parameters.** Valid: L8 207.6M vs B12 286.3M (27% fewer; 33% fewer
+   block parameters). Added to the abstract and 2.2; F1 now has a second panel with total stored
+   parameters on the x axis (`scripts/looped_analyze.py`; figures regenerated, results files
+   untouched). The abstract now says rho is recovery of block plus lookup capacity.
+3. **H4 is a clean negative on free test-time compute.** Valid: LR at its best R = 3 (E = 16, 33%
+   more inference compute than L8's E = 12) is still 0.0030 worse than L8. Added to the abstract
+   and 3.2; LR's best-R value is footnoted in the main table.
+4. Small fixes, all valid: the 2.2 table header had been changed on disk to "Unique params /
+   Effective params" (the columns are layer counts; now "U (unique layers) / E (effective
+   layers)"); LR's per-seed CORE (0.151, 0.128, 0.137; range 0.023 vs 0.004-0.012 for every
+   other arm) is now stated so its 0.138 mean is not read as a deficit; "half of the value of a
+   layer" is qualified "in this comparison"; the learned `resid_lambdas` / `x0_lambdas` (seed
+   means) of B12, B8, L8, LR are tabulated in 3.5 (L8's shared core layers learn residual
+   scalars 0.73-0.76 vs 0.48-0.51 for B8's untied counterparts; their x0 re-injection stays in
+   the untied range); F2 and F5 are now embedded; the horizon confound is stated in both
+   directions.
+5. TL;DR added under the paper title; README section leads with F1 and a TL;DR.
+6. Pre-registering the SFT/RL phase (checkpoints, frozen eval set, the question "does the
+   equal-parameter looped model close more of the gap to B_E after SFT/RL than in pretraining"):
+   a planning item for Phase 3, not a paper change. Noted for the author.

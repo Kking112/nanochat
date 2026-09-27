@@ -80,7 +80,7 @@ emit("Selected matrix LR multipliers: " + ", ".join(f"{arm} {selected_lr[arm]:g}
 emit()
 emit("| arm | layout | U/E | block params | value-embed params | val_bpb per seed | mean | SD | CORE mean | diverged | tok/s median | peak VRAM MiB | train FLOPs |")
 emit("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
-unique_params, train_flops = {}, {}
+unique_params, total_params, train_flops = {}, {}, {}
 for arm in ARMS:
     rows = runs[arm]
     if not rows:
@@ -89,6 +89,7 @@ for arm in ARMS:
     config = logs[rows[0]["run_id"]][0]
     counts = config["param_counts"]
     unique_params[arm] = counts["transformer_matrices"]
+    total_params[arm] = counts["total"]
     train_flops[arm] = statistics.mean(float(r["train_flops"]) for r in rows)
     effective = f"{counts['effective_layers']}" if not rows[0]["train_loops"] else "8-20"
     cores = [float(r["core"]) for r in rows if r["diverged"] == "0" and r["core"]]
@@ -201,25 +202,31 @@ def save(fig, name):
     plt.close(fig)
     emit(f"- `{path}`")
 
+LABEL_DY = {"L6s": -6, "L6p": 6} # these two sit on top of each other in F1/F2: nudge their labels apart
+
 def mark(ax, x, arm, **kwargs):
     """One arm: every seed as a small dot, the mean as the marker with a surface ring, labeled directly."""
     values = list(bpb[arm].values())
     ax.scatter([x] * len(values), values, s=14, color=COLOR[arm], alpha=0.6, linewidths=0, zorder=2)
     ax.scatter([x], [mean(arm)], s=80, marker=MARKER[arm], color=COLOR[arm], edgecolors=SURFACE, linewidths=2, zorder=3)
-    ax.annotate(arm, (x, mean(arm)), xytext=(8, 0), textcoords="offset points", va="center", color=INK, fontsize=9, **kwargs)
+    ax.annotate(arm, (x, mean(arm)), xytext=(8, LABEL_DY.get(arm, 0)), textcoords="offset points", va="center", color=INK, fontsize=9, **kwargs)
 
 have = [arm for arm in ARMS if bpb[arm] and arm in unique_params]
 emit("## Figures")
 emit()
 if have:
-    # F1: val_bpb vs unique parameters
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    # F1: val_bpb vs stored parameters, block-only and total (value embeddings are tied to unique
+    # layers and outweigh the blocks at this width, so the two x axes tell different stories)
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
     for arm in have:
         mark(ax, unique_params[arm] / 1e6, arm)
-    ax.set_xlabel("unique block parameters (millions), embeddings excluded")
+        mark(ax2, total_params[arm] / 1e6, arm)
+    ax.set_xlabel("unique block parameters (millions)")
+    ax2.set_xlabel("total stored parameters (millions)")
     ax.set_ylabel("final val_bpb (lower is better)")
     ax.set_title("F1  Loss vs stored parameters   ■ untied   ● looped")
-    ax.margins(x=0.12)
+    ax2.set_title("same, counting every stored parameter")
+    ax.margins(x=0.12); ax2.margins(x=0.12)
     save(fig, "F1_bpb_vs_params.png")
 
     # F2: val_bpb vs training FLOPs
