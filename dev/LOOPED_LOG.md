@@ -505,3 +505,29 @@ Orphan logs not part of any analysis: `looped_d20_B20_lr1.0_h1.0_s0_20260923_053
 
 **Next: the write-up (deliverable 7.3) and the README summary with F1 and F3.** Phase 3 (SFT,
 chat evals, synthetic probes) is optional and is blocked by the `chat_sft.py` layout-keys issue.
+
+---
+
+## 2026-09-27 (later): write-up delivered; corrections from an independent fact check
+
+`paper/looped_nanochat.md` and the README summary were written from `results/` and then checked
+by a separate reviewer against the raw files. Every headline number and every H1-H4 verdict was
+confirmed. 19 discrepancies were found and fixed in the paper; none changes a conclusion. Two of
+them correct earlier entries of THIS notebook (left as written above, corrected here):
+
+- The 2026-09-22 entry gives the main matrix as 32.4 GPU-hours and the loop sweep as ~9.4 h. The
+  sum of the 21 rows' `wall_clock_s` is **30.6 h**, and the loop sweep's stdout logs run from
+  00:33 to ~05:12, i.e. **~4.7 h** (the 09:54 end time came from the files' shared mtime after a
+  copy, not from the run). Study total is **~126 GPU-hours**, not ~130-132.
+- "49 training runs" (Phase 1 only) was used where the whole CSV was meant: **57 rows**, all
+  `diverged = 0`, all with the same data hash.
+
+Other corrections: the rho range is the min/max over the 27 seed combinations, not a "95%"
+interval (and it replaces the pre-registered bootstrap interval, now listed as a deviation); the
+§3.5 gradient-norm sentences now say what the logs show (total block-gradient norm within 2.2x of
+its run median, core/non-core ratio between 0.2 and 4.6, loss logged only every 100 steps); at
+d20 the ordering B_E < looped < B_U holds at 19 of 20 evaluations (from step 500); effect sizes
+are 17-35 pooled SDs; LR's best-R cost vs L8 is 0.0030; VRAM is now in GiB; the infer_bench prompt
+is 1792 tokens; LR's throughput is given as tokens per wall-clock second (238k) with its per-step
+median (265k) footnoted; main-run B12 `backout_lambda` is 0.39-0.44; the Appendix A learning-rate
+sensitivity comparison and the Appendix B largest-gains list were made complete.
