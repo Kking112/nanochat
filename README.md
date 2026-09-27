@@ -111,7 +111,7 @@ The important thing to note is that nanochat is written and configured around on
 
 <p align="center"><img src="results/figures/F1_bpb_vs_params.png" width="92%"></p>
 
-**TL;DR.** Looping a transformer's middle layers a second time, with nothing else changed, recovers about half of the loss that dropping those layers costs (ρ = 0.53 at d12 over 3 seeds, 0.50 at d20), stores 27% fewer parameters than the compute-matched deeper model, and trains and decodes at the deeper model's speed. Randomized-loop training makes the loop count a safe inference knob but not a source of gains.
+**TL;DR.** Looping a transformer's middle layers a second time, with nothing else changed, recovers about half of the loss that dropping those layers costs (ρ = 0.53 at d12 over 3 seeds, 0.52 in a post-hoc check at the stock learning rate, 0.50 at d20), stores 27% fewer parameters than the compute-matched deeper model, and trains and decodes at the deeper model's speed. Randomized-loop training makes the loop count a safe inference knob but not a source of gains.
 
 This fork adds a controlled, single-GPU comparison of standard and looped (weight-shared depth) transformers, pre-registered in [looped_nanochat_proposal.md](looped_nanochat_proposal.md) before any run. The write-up is [paper/looped_nanochat.md](paper/looped_nanochat.md); the lab notebook, including every deviation from the pinned upstream commit `92d63d4`, is [dev/LOOPED_LOG.md](dev/LOOPED_LOG.md); the raw results are under [results/](results/).
 

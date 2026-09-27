@@ -566,3 +566,23 @@ and acted on as follows.
 6. Pre-registering the SFT/RL phase (checkpoints, frozen eval set, the question "does the
    equal-parameter looped model close more of the gap to B_E after SFT/RL than in pretraining"):
    a planning item for Phase 3, not a paper change. Noted for the author.
+
+---
+
+## 2026-09-27 (evening): post-hoc 1x check done. rho(L8) at stock LR = 0.52
+
+`bash runs/looped_lr1_check.sh` (15:19 to 18:15, 2.9 GPU-hours, at `8d804bb`, clean, 0 diverged),
+approved by the author after the external review. B8 and L8 at stock 1x `matrix_lr`, seed 0, full
+horizon; B_E is the Phase 0 B12 run at 1x (0.847749; the stock-code-path run: 0.847663).
+
+| arm | 1x val_bpb | CORE | 2x seed mean | 1x - 2x |
+|---|---|---|---|---|
+| B12 (Phase 0) | 0.84775 | 0.149 | 0.85087 | -0.0031 |
+| L8 | 0.85754 | 0.164 | 0.85969 | -0.0021 |
+| B8 | 0.86801 | 0.138 | 0.86978 | -0.0018 |
+
+**rho(L8) at 1x = 0.517** (0.514 with the stock-path B12), vs 0.534 at 2x, inside the 2x seed
+combination spread (0.49-0.59). Gaps at 1x: B8 - L8 0.0105, B8 - B12 0.0203 (2x: 0.0101, 0.0189).
+Every arm is 0.002-0.003 better at 1x; the recovery fraction is unchanged. Reported as Appendix E
+of the paper and as deviation 10; the pre-registered d12 statistics remain those at 2x. Study
+total ~129 GPU-hours.
