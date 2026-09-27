@@ -1,0 +1,22 @@
+2026-09-27 01:56:56,026 - nanochat.common - [32m[1mINFO[0m - Distributed world size: 1
+2026-09-27 01:56:56,026 - nanochat.checkpoint_manager - [32m[1mINFO[0m - Loading model from /home/neo/.cache/nanochat/base_checkpoints/looped_L6s_lr2.0_h1.0_s0 with step 2520
+2026-09-27 01:56:56,217 - nanochat.checkpoint_manager - [32m[1mINFO[0m - Building model with config: {'sequence_len': 2048, 'vocab_size': 32768, 'n_layer': 6, 'n_head': 6, 'n_kv_head': 6, 'n_embd': 768, 'window_pattern': 'L', 'n_prelude': 2, 'n_core': 2, 'n_coda': 2, 'n_loop': 4}
+2026-09-27 01:56:56,271 - nanochat.common - [33m[1mWARNING[0m - Peak bandwidth undefined for: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, MBU will show as 0%
+2026-09-27 01:56:56,271 - nanochat.common - [33m[1mWARNING[0m - Peak flops undefined for: NVIDIA RTX PRO 6000 Blackwell Workstation Edition, MFU will show as 0%
+Autodetected device type: cuda
+note: clamping prompt to 1792 tokens so prompt+decode fits sequence_len=2048
+====================================================================================================
+Model: base  (step 2520) | depth 6, dim 768, heads 6, kv heads 6 (GQA)
+GPU: NVIDIA RTX PRO 6000 Blackwell Workstation Edition | peak bandwidth inf TB/s | peak compute inf TFLOPS | VRAM 95 GiB
+----------------------------------------------------------------------------------------------------
+Parameters: 168,296,702 (100,663,296 bfloat16, 67,633,406 float32) | weight bytes as stored: 450 MiB
+KV cache: 36,864 bytes/token stored | 70,778,880 bytes read/step at context 1920 (window pattern L)
+Theoretical decode ceiling at batch 1: inf tok/s | max ~1,344 full-context rows in VRAM
+====================================================================================================
+Prefill (batch 1, 1792 tokens): 318,173 tok/s | MFU 0.0%
+ batch   TTFT ms   TPOT ms      tok/s   MBU %   MFU %  VRAM GiB  steps
+----------------------------------------------------------------------
+     1       5.6      2.57        388     0.0    0.00      1.18    255
+    32       8.3      3.31      9,679     0.0    0.00      2.99    255
+----------------------------------------------------------------------
+{"source": "base", "step": 2520, "model_config": {"sequence_len": 2048, "vocab_size": 32768, "n_layer": 6, "n_head": 6, "n_kv_head": 6, "n_embd": 768, "window_pattern": "L", "n_prelude": 2, "n_core": 2, "n_coda": 2, "n_loop": 4}, "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "peak_bandwidth_bytes_per_sec": null, "total_vram_bytes": 101949898752, "num_params": 168296702, "param_dtypes": {"float32": 67633406, "bfloat16": 100663296}, "weight_bytes": 471860216, "kv_bytes_per_token": 36864, "kv_read_bytes_per_step": 70778880, "context_mid": 1920, "peak_flops_per_sec": null, "decode_flops_per_token": 290980752, "ceiling_bs1_tok_per_sec": null, "max_full_context_rows": 1344, "prompt_tokens": 1792, "decode_tokens": 256, "temperature": 0.0, "sweep": [{"batch_size": 1, "ttft_sec": 0.005591, "tpot_sec": 0.002566, "tok_per_sec": 388.3, "mbu_percent": 0.0, "mfu_percent": 0.0, "peak_vram_bytes": 1270896640, "decode_steps": 255}, {"batch_size": 32, "ttft_sec": 0.008307, "tpot_sec": 0.003306, "tok_per_sec": 9678.5, "mbu_percent": 0.0, "mfu_percent": 0.0, "peak_vram_bytes": 3205303296, "decode_steps": 255}], "prefill": {"tok_per_sec": 318172.6, "mfu_percent": 0.0, "time_sec": 0.005632}}
