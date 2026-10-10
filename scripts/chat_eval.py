@@ -10,24 +10,30 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
 
 import argparse
 from functools import partial
+
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
+from nanochat.checkpoint_manager import CHECKPOINT_SOURCES, load_model
+from nanochat.common import (
+    autodetect_device_type,
+    compute_cleanup,
+    compute_init,
+    get_dist_info,
+    print0,
+)
 from nanochat.engine import Engine
-
-from tasks.humaneval import HumanEval
-from tasks.mmlu import MMLU
 from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
+from tasks.humaneval import HumanEval
+from tasks.mmlu import MMLU
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
 def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
 
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    ddp, ddp_rank, _ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
@@ -86,7 +92,7 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
 
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    ddp, ddp_rank, _ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
     bos = tokenizer.get_bos_token_id() # use BOS as pad token is ok, these positions are ignored
 
@@ -179,10 +185,10 @@ if __name__ == "__main__":
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--source', type=str, required=True, help="Source of the model: sft|rl")
+    parser.add_argument('-i', '--source', type=str, required=True, choices=tuple(CHECKPOINT_SOURCES), help="Checkpoint source")
     parser.add_argument('-a', '--task-name', type=str, default=None, help="Task name. Default = all tasks. Use | to split multiple tasks.")
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
-    parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
+    parser.add_argument('-m', '--max-new-tokens', type=int, default=None)
     parser.add_argument('-n', '--num-samples', type=int, default=1)
     parser.add_argument('-k', '--top-k', type=int, default=50)
     parser.add_argument('-b', '--batch-size', type=int, default=8, help='Batch size for categorical evaluation')
@@ -191,6 +197,8 @@ if __name__ == "__main__":
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
     args = parser.parse_args()
+    if args.max_new_tokens is None:
+        args.max_new_tokens = 1024 if args.source.startswith("reason_") else 512
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)

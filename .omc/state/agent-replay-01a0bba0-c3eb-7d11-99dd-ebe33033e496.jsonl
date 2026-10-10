@@ -1,0 +1,6 @@
+{"t":0,"agent":"01a0bba","agent_type":"default","event":"agent_start","parent_mode":"none","model":"gpt-6-astra"}
+{"t":0,"agent":"01a0bba","agent_type":"default","event":"agent_start","parent_mode":"none","model":"gpt-6-astra"}
+{"t":0,"agent":"01a0bba","agent_type":"default","event":"agent_start","parent_mode":"none","model":"gpt-6-astra"}
+{"t":0,"agent":"01a0bba","agent_type":"default","event":"agent_stop","success":true,"duration_ms":1322270}
+{"t":0,"agent":"01a0bba","agent_type":"default","event":"agent_stop","success":true,"duration_ms":1535838}
+{"t":0,"agent":"01a0bba","agent_type":"default","event":"agent_stop","success":true,"duration_ms":1582185}
