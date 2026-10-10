@@ -1,0 +1,38 @@
+{
+  "agents": [
+    {
+      "agent_id": "01a0bba2-3a15-7761-83d1-a430db235e1d",
+      "agent_type": "default",
+      "started_at": "2026-09-19T21:46:09.468Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "model": "gpt-6-astra",
+      "completed_at": "2026-09-19T22:08:11.738Z",
+      "duration_ms": 1322270
+    },
+    {
+      "agent_id": "01a0bba2-6087-7d11-a342-15e1379f95c2",
+      "agent_type": "default",
+      "started_at": "2026-09-19T21:46:17.414Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "model": "gpt-6-astra",
+      "completed_at": "2026-09-19T22:12:39.599Z",
+      "duration_ms": 1582185
+    },
+    {
+      "agent_id": "01a0bba2-8183-7770-babb-64d4f393b60e",
+      "agent_type": "default",
+      "started_at": "2026-09-19T21:46:25.894Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "model": "gpt-6-astra",
+      "completed_at": "2026-09-19T22:12:01.732Z",
+      "duration_ms": 1535838
+    }
+  ],
+  "total_spawned": 3,
+  "total_completed": 3,
+  "total_failed": 0,
+  "last_updated": "2026-09-19T22:12:39.601Z"
+}
