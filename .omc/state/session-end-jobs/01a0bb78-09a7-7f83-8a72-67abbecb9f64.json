@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "jobId": "5f8a557e-6b73-4477-9e1b-0f988bc4f9f6",
+  "sessionId": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+  "scopeKey": "119f8284beee443da82b9ec8ee70750182a94df28304f8d44b60c0669e9ff299",
+  "revision": 39,
+  "createdAt": "2026-09-19T21:00:20.285Z",
+  "updatedAt": "2026-09-19T21:00:52.177Z",
+  "producerGraceExpiresAt": "2026-09-19T21:00:50.286Z",
+  "bestEffortDeadlineAt": "2026-09-19T21:01:41.286Z",
+  "producers": {
+    "core": {
+      "state": "no-op",
+      "intentKey": "ae7f4380eba144aefd887b3532eb0f530a0d2214e01cd7f2563d7abd079f2567",
+      "payloadDigest": "ae7f4380eba144aefd887b3532eb0f530a0d2214e01cd7f2563d7abd079f2567",
+      "sealedAt": "2026-09-19T21:00:52.177Z",
+      "sealedBy": "recovery"
+    },
+    "wiki": {
+      "state": "no-op",
+      "sealedAt": "2026-09-19T21:00:52.177Z",
+      "sealedBy": "recovery"
+    }
+  },
+  "actions": {
+    "foreground-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 3,
+      "idempotencyKey": "58d5d439b6302b85359307d8657d30caf10645a4283fd3c9ae1aa05873ee34fd",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 9000,
+      "claimedAt": "2026-09-19T21:00:52.089Z",
+      "runner": {
+        "attempt": 3,
+        "runnerNonce": "0c4232b2-dbc9-448b-952c-67f26be8c152",
+        "phase": "terminal",
+        "deadlineAt": "2026-09-19T21:01:02.056Z"
+      },
+      "lastOutcomeCode": "required-foreground-cleanup-exhausted"
+    },
+    "wiki-capture": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "3b14b39417b78a02c5178abf992489988ebf0a387101d5a9edef1c91c8952992",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "team-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "6cc81bb1075e5743410bf8c3cffffeb0fb4efe0d313eed71367a9fde999f38c3",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "python-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "006557dbe1664820b2e5278b0bb91be23530037c8ed4e2b6a4d6c472b3e9c8ed",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "reply-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "03407d81794a0fdfbecec30e1590cb0cdadc6be6652b0a9f1edd7d8013ac596c",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "callback": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "a96f3debed6aa981b8f782fb48e77f4b49c28eb03d86a11ad43ab84c19204278",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 2000,
+      "lastOutcomeCode": "best-effort-core-producer-unavailable"
+    },
+    "notification": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "0104a32cd5c0b8618c811098004705417267a5a1f8bece0787ab1d8b8ab4962c",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 2000,
+      "lastOutcomeCode": "best-effort-core-producer-unavailable"
+    },
+    "openclaw": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "eb52d14980b134a5fccc0238c9eeccb0d93300137c0abf57b1df987d562a0dc2",
+      "payload": {
+        "transcriptPath": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+        "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+        "reason": "other",
+        "input": {
+          "session_id": "01a0bb78-09a7-7f83-8a72-67abbecb9f64",
+          "transcript_path": "/home/neo/.codex/sessions/2026/09/19/rollout-2026-09-19T17-00-01-01a0bb78-09a7-7f83-8a72-67abbecb9f64.jsonl",
+          "cwd": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+          "hook_event_name": "SessionEnd",
+          "reason": "other"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 3,
+          "outcomeCode": "runner-exit-1"
+        }
+      },
+      "budgetMs": 2000,
+      "lastOutcomeCode": "best-effort-core-producer-unavailable"
+    }
+  },
+  "owner": null,
+  "phase": "complete",
+  "completion": {
+    "completedAt": "2026-09-19T21:00:52.177Z",
+    "terminalDigest": "1cdad20c421d5cea657792676807df42434772274b3c62389adda25f51e2651c",
+    "terminalRevision": 39
+  }
+}

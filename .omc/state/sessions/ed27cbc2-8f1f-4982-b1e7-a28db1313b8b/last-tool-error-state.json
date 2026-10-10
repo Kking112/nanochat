@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"kill 2482760 2>/dev/null; sleep 3\\n# ensure any child base_train processes are gone\\npkill -f \\\"scripts.base_train --depth=6\\\" 2>/dev/null\\nsleep 2\\necho \\\"=== remaining base_train procs =...",
+  "error": "Exit code 144",
+  "timestamp": "2026-07-04T17:12:27.515Z",
+  "retry_count": 1
+}

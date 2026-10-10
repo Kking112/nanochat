@@ -1,0 +1,230 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1783115908375,
+  "projectRoot": "/home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "cd /home/neo/Desktop/Projects/Experiments_V2/Loop_MoE_Nanochat/nanochat\nPYTHONPATH=. NANOCHAT_DTYPE=float32 .venv/bin/python -m pytest tests/test_loopmoe.py -q 2>&1 | tail -6",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "scripts",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "dev": {
+      "path": "dev",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1783115908373,
+      "keyFiles": [
+        "LEADERBOARD.md",
+        "LOG.md",
+        "estimate_gpt3_core.ipynb",
+        "nanochat.png",
+        "repackage_data_reference.py"
+      ]
+    },
+    "nanochat": {
+      "path": "nanochat",
+      "purpose": null,
+      "fileCount": 14,
+      "lastAccessed": 1783115908373,
+      "keyFiles": [
+        "__init__.py",
+        "checkpoint_manager.py",
+        "common.py",
+        "core_eval.py",
+        "dataloader.py"
+      ]
+    },
+    "runs": {
+      "path": "runs",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1783115908373,
+      "keyFiles": [
+        "miniseries.sh",
+        "runcpu.sh",
+        "scaling_laws.sh",
+        "speedrun.sh"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 8,
+      "lastAccessed": 1783115908374,
+      "keyFiles": [
+        "base_eval.py",
+        "base_train.py",
+        "chat_cli.py",
+        "chat_eval.py",
+        "chat_rl.py"
+      ]
+    },
+    "tasks": {
+      "path": "tasks",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1783115908374,
+      "keyFiles": [
+        "arc.py",
+        "common.py",
+        "gsm8k.py",
+        "humaneval.py",
+        "mmlu.py"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 6,
+      "lastAccessed": 1783115908374,
+      "keyFiles": [
+        "test_attention_fallback.py",
+        "test_engine.py",
+        "test_execution.py",
+        "test_optim.py",
+        "test_tasks.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "nanochat/gpt.py",
+      "accessCount": 54,
+      "lastAccessed": 1783183094554,
+      "type": "file"
+    },
+    {
+      "path": "scripts/base_train.py",
+      "accessCount": 27,
+      "lastAccessed": 1783181719081,
+      "type": "file"
+    },
+    {
+      "path": "LOOPMOE.md",
+      "accessCount": 11,
+      "lastAccessed": 1783184015775,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_loopmoe.py",
+      "accessCount": 7,
+      "lastAccessed": 1783117767663,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 6,
+      "lastAccessed": 1783119351852,
+      "type": "file"
+    },
+    {
+      "path": "nanochat/engine.py",
+      "accessCount": 4,
+      "lastAccessed": 1783117749661,
+      "type": "file"
+    },
+    {
+      "path": "nanochat/fsdp_utils.py",
+      "accessCount": 4,
+      "lastAccessed": 1783119387054,
+      "type": "file"
+    },
+    {
+      "path": "nanochat/optim.py",
+      "accessCount": 2,
+      "lastAccessed": 1783118272885,
+      "type": "file"
+    },
+    {
+      "path": "runs/loopmoe_small.sh",
+      "accessCount": 2,
+      "lastAccessed": 1783181796833,
+      "type": "file"
+    },
+    {
+      "path": "runs/loopmoe_large.sh",
+      "accessCount": 2,
+      "lastAccessed": 1783181802110,
+      "type": "file"
+    },
+    {
+      "path": "nanochat/common.py",
+      "accessCount": 1,
+      "lastAccessed": 1783116046246,
+      "type": "file"
+    },
+    {
+      "path": "runs/speedrun.sh",
+      "accessCount": 1,
+      "lastAccessed": 1783116058659,
+      "type": "file"
+    },
+    {
+      "path": "runs/runcpu.sh",
+      "accessCount": 1,
+      "lastAccessed": 1783116059135,
+      "type": "file"
+    },
+    {
+      "path": "pyproject.toml",
+      "accessCount": 1,
+      "lastAccessed": 1783116060072,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_optim.py",
+      "accessCount": 1,
+      "lastAccessed": 1783116060392,
+      "type": "file"
+    },
+    {
+      "path": "nanochat/checkpoint_manager.py",
+      "accessCount": 1,
+      "lastAccessed": 1783116084580,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
